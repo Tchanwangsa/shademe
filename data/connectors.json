@@ -1,0 +1,19 @@
+[
+ {"a": 13794345654, "b": 6696274734, "name": "Emporium -> Myer",
+  "note": "Enclosed bridge over Little Bourke St. Emporium's upper levels join Myer's Bourke St store directly; this is the link that makes Melbourne Central -> Myer one indoor walk. 17m."},
+
+ {"a": 10787313548, "b": 9892925633, "name": "Degraves St Subway -> Flinders St Station",
+  "note": "Campbell Arcade / Degraves St Subway runs under Flinders St into the Flinders Street Station subway concourse. Both ends are OSM level -1; only the join is unmapped. 26m."},
+
+ {"a": 10786862358, "b": 10786862356, "name": "Degraves concourse -> Elizabeth St Subway",
+  "note": "The Flinders Street Station underpass runs the width of the forecourt with exits at Degraves St and Elizabeth St. Both nodes are level -1 subway footway. 42m."},
+
+ {"a": 12483935248, "b": 594826770, "name": "MidCity Arcade L1 stairs -> arcade floor", "indoor": true,
+  "note": "OSM way 1349501396 (highway=steps, handrail=yes) is mis-tagged level=1 only and its foot node 12483935248 is a dangling endpoint 3.2m from MidCity Arcade node 594826770 (level 0). Verified on osm.org: the node belongs to no other way. Without this link the entire MidCity Centre level-1 corridor network (12 nodes) is unreachable from the walking graph. Both ends sit inside the same CoM building footprint. 3m."},
+
+ {"a": 6696274739, "b": 598400059, "name": "Bourke St Mall crossing -> The Walk Arcade", "indoor": false,
+  "note": "Bourke Street Mall is OSM way 125110412 tagged area=yes/area:highway=pedestrian, i.e. a closed 864m polygon. Both nodes lie ON that polygon, so the crossing is walkable by construction, but the graph only follows the perimeter: 32m straight becomes 209m. indoor=false so shade is sampled from the raster -- the mall is open sky. 32m."},
+
+ {"a": 1327098219, "b": 598401524, "name": "Bourke St Mall crossing -> Royal Arcade (GPO side)", "indoor": false,
+  "note": "Same Bourke Street Mall polygon (way 125110412); both nodes lie on it. Links the GPO/Postal Lane covered frontage to the Royal Arcade entrance. 33m straight vs 114m around the perimeter. indoor=false: the mall is open to the sky. 34m."}
+]

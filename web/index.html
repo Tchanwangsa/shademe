@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Laneway — weather-aware walking routes for Melbourne</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<link href="style.css" rel="stylesheet">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ============================ LEFT RAIL ============================ -->
+  <aside class="rail">
+
+    <header class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M4 28V13.5C4 8.253 8.253 4 13.5 4S23 8.253 23 13.5V28" />
+        <path d="M10 28v-14a3.5 3.5 0 0 1 7 0v14" opacity=".55" />
+        <path d="M28 28V9" opacity=".35" />
+      </svg>
+      <div class="brand-text">
+        <h1>Laneway</h1>
+        <p>Weather-aware walking · Melbourne CBD</p>
+      </div>
+      <span id="dataBadge" class="badge badge-mock" hidden>
+        <span class="dot"></span><span id="dataBadgeText">demo data</span>
+      </span>
+    </header>
+
+    <p class="thesis">
+      Melbourne has a second pedestrian network — arcades, subways and building
+      pass-throughs — that mapping apps ignore. We route you through it, weighted
+      by what the weather is actually doing.
+    </p>
+
+    <!-- ---------------------------- controls ---------------------------- -->
+    <section class="panel controls">
+      <div class="seg" role="tablist" aria-label="Season mode">
+        <button class="seg-btn is-active" role="tab" data-mode="summer" aria-selected="true">
+          <svg viewBox="0 0 20 20" aria-hidden="true" class="ico">
+            <circle cx="10" cy="10" r="3.6"/>
+            <g class="rays"><path d="M10 1.6v2.2M10 16.2v2.2M18.4 10h-2.2M3.8 10H1.6M15.9 4.1l-1.6 1.6M5.7 14.3l-1.6 1.6M15.9 15.9l-1.6-1.6M5.7 5.7 4.1 4.1"/></g>
+          </svg>
+          Summer<span class="seg-sub">heat</span>
+        </button>
+        <button class="seg-btn" role="tab" data-mode="winter" aria-selected="false">
+          <svg viewBox="0 0 20 20" aria-hidden="true" class="ico">
+            <path d="M4.2 11.6a3.4 3.4 0 0 1 .7-6.7 4.5 4.5 0 0 1 8.5-.7 3.6 3.6 0 0 1 2 6.9"/>
+            <path d="M6.6 14.2 5.6 17M10.4 14.2 9.4 17M14.2 14.2 13.2 17" opacity=".65"/>
+          </svg>
+          Winter<span class="seg-sub">rain + wind</span>
+        </button>
+      </div>
+
+      <div class="od">
+        <div class="od-spine" aria-hidden="true">
+          <span class="od-dot od-dot-a"></span>
+          <span class="od-line"></span>
+          <span class="od-dot od-dot-b"></span>
+        </div>
+        <div class="od-fields">
+          <label class="field">
+            <span class="field-label">From</span>
+            <div class="field-row">
+              <select id="fromSel"></select>
+              <button class="pin-btn" id="pinFrom" title="Pick origin on the map" aria-label="Pick origin on the map">
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 18s6-5.2 6-9.6A6 6 0 0 0 4 8.4C4 12.8 10 18 10 18Z"/><circle cx="10" cy="8.3" r="2.1"/></svg>
+              </button>
+            </div>
+          </label>
+          <label class="field">
+            <span class="field-label">To</span>
+            <div class="field-row">
+              <select id="toSel"></select>
+              <button class="pin-btn" id="pinTo" title="Pick destination on the map" aria-label="Pick destination on the map">
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 18s6-5.2 6-9.6A6 6 0 0 0 4 8.4C4 12.8 10 18 10 18Z"/><circle cx="10" cy="8.3" r="2.1"/></svg>
+              </button>
+            </div>
+          </label>
+        </div>
+        <button class="swap-btn" id="swapBtn" title="Swap origin and destination" aria-label="Swap origin and destination">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 3.5v13M6.5 16.5 3.6 13.4M6.5 16.5l2.9-3.1M13.5 16.5v-13M13.5 3.5l2.9 3.1M13.5 3.5l-2.9 3.1"/></svg>
+        </button>
+      </div>
+      <p class="hint" id="pickHint" hidden>Click the map to place the point.</p>
+    </section>
+
+    <!-- ---------------------------- the delta --------------------------- -->
+    <section class="panel delta" id="deltaPanel">
+      <div class="panel-head">
+        <h2>The trade</h2>
+        <span class="panel-note" id="deltaHour">16:00 · demo day 14 Jan</span>
+      </div>
+
+      <div class="headline" id="headline">
+        <span class="hl-part">
+          <span class="hl-cost" id="hlCost">+12%</span>
+          <span class="hl-cost-label" id="hlCostLabel">longer</span>
+        </span>
+        <svg class="hl-arrow" viewBox="0 0 40 24" aria-hidden="true"><path d="M2 12h33M28 5l7 7-7 7"/></svg>
+        <span class="hl-part">
+          <span class="hl-win" id="hlWin">−70%</span>
+          <span class="hl-win-label" id="hlWinLabel">less sun</span>
+        </span>
+      </div>
+
+      <div class="cmp">
+        <div class="cmp-row cmp-head">
+          <span class="cmp-metric"></span>
+          <span class="cmp-col cmp-col-short">
+            <i class="swatch swatch-short"></i>Shortest
+            <em>what maps give you</em>
+          </span>
+          <span class="cmp-col cmp-col-shade">
+            <i class="swatch swatch-shade"></i>Laneway
+            <em>weather-weighted</em>
+          </span>
+        </div>
+        <div class="cmp-row">
+          <span class="cmp-metric">Distance</span>
+          <span class="cmp-col num" id="mShortDist">—</span>
+          <span class="cmp-col num accent" id="mShadeDist">—</span>
+        </div>
+        <div class="cmp-row cmp-row-key">
+          <span class="cmp-metric">In direct sun</span>
+          <span class="cmp-col num" id="mShortSun">—</span>
+          <span class="cmp-col num accent" id="mShadeSun">—</span>
+        </div>
+        <div class="cmp-row">
+          <span class="cmp-metric">Indoor / covered</span>
+          <span class="cmp-col num" id="mShortIndoor">—</span>
+          <span class="cmp-col num accent" id="mShadeIndoor">—</span>
+        </div>
+        <div class="cmp-row">
+          <span class="cmp-metric">Walk time</span>
+          <span class="cmp-col num" id="mShortTime">—</span>
+          <span class="cmp-col num accent" id="mShadeTime">—</span>
+        </div>
+        <div class="cmp-row">
+          <span class="cmp-metric">Heat load</span>
+          <span class="cmp-col num" id="mShortHeat">—</span>
+          <span class="cmp-col num accent" id="mShadeHeat">—</span>
+        </div>
+      </div>
+
+      <div class="sunbars">
+        <div class="sunbar">
+          <span class="sunbar-label">Shortest</span>
+          <span class="sunbar-track"><span class="sunbar-fill sunbar-fill-short" id="barShort"></span></span>
+          <span class="sunbar-val" id="barShortVal">—</span>
+        </div>
+        <div class="sunbar">
+          <span class="sunbar-label">Laneway</span>
+          <span class="sunbar-track"><span class="sunbar-fill sunbar-fill-shade" id="barShade"></span></span>
+          <span class="sunbar-val" id="barShadeVal">—</span>
+        </div>
+        <p class="sunbars-cap">share of the walk in direct sun</p>
+      </div>
+    </section>
+
+    <!-- ---------------------------- weather ----------------------------- -->
+    <section class="panel weather">
+      <div class="panel-head">
+        <h2>Conditions</h2>
+        <span class="panel-note" id="wxSource">—</span>
+      </div>
+
+      <div class="wx-tiles">
+        <div class="wx-tile">
+          <span class="wx-label">Feels like</span>
+          <span class="wx-value" id="wxTemp">—<em>°C</em></span>
+        </div>
+        <div class="wx-tile">
+          <span class="wx-label">Cloud</span>
+          <span class="wx-value" id="wxCloud">—<em>%</em></span>
+        </div>
+        <div class="wx-tile" id="wxThirdTile">
+          <span class="wx-label" id="wxThirdLabel">UV index</span>
+          <span class="wx-value" id="wxThird">—</span>
+        </div>
+      </div>
+
+      <div class="split">
+        <div class="split-head">
+          <span class="split-title">Radiation split</span>
+          <span class="split-readout">shade value <b id="shadeValue">—</b></span>
+        </div>
+        <div class="split-bar">
+          <span class="split-direct" id="splitDirect"></span>
+          <span class="split-diffuse" id="splitDiffuse"></span>
+        </div>
+        <div class="split-legend">
+          <span><i class="swatch swatch-direct"></i>Direct beam <b id="wxDirect">—</b> W/m²</span>
+          <span><i class="swatch swatch-diffuse"></i>Diffuse sky <b id="wxDiffuse">—</b> W/m²</span>
+        </div>
+        <p class="split-why" id="splitWhy">
+          Shade only blocks the <b>direct</b> beam. Diffuse light arrives from the whole sky
+          dome, so under cloud a shadow is worth almost nothing — and a purely geometric
+          shade map draws the same shadow anyway.
+        </p>
+      </div>
+
+      <div class="weights">
+        <span>W<sub>heat</sub> <b id="wHeat">—</b></span>
+        <span>W<sub>wet</sub> <b id="wWet">—</b></span>
+        <span class="weights-note">cost-function weights</span>
+      </div>
+    </section>
+
+    <footer class="rail-foot">
+      <span>Buildings + canopy: City of Melbourne Open Data (CC-BY)</span>
+      <span>Network: OpenStreetMap (ODbL) · Weather: Open-Meteo (CC-BY)</span>
+    </footer>
+  </aside>
+
+  <!-- ============================== MAP =============================== -->
+  <main class="map-wrap">
+    <div id="map"></div>
+
+    <div class="map-top">
+      <div class="legend">
+        <span class="legend-item"><i class="line line-short"></i>Shortest route</span>
+        <span class="legend-item"><i class="line line-shade"></i>Laneway route</span>
+        <span class="legend-item"><i class="line line-indoor"></i>Indoor / arcade</span>
+        <span class="legend-item"><i class="chip chip-shade"></i>Modelled shadow</span>
+      </div>
+    </div>
+
+    <div class="map-bottom">
+      <div class="scrub">
+        <div class="scrub-head">
+          <span class="scrub-title">Time of day</span>
+          <span class="scrub-clock" id="clock">16:00</span>
+          <span class="scrub-sub" id="sunNote">shadow model · 14 Jan</span>
+        </div>
+        <input type="range" id="hourSlider" min="6" max="20" step="1" value="16"
+               aria-label="Hour of day">
+        <div class="scrub-ticks" id="ticks"></div>
+      </div>
+      <div class="opacity">
+        <label for="opacitySlider">Shadow</label>
+        <input type="range" id="opacitySlider" min="0" max="100" step="1" value="80"
+               aria-label="Shadow overlay opacity">
+      </div>
+    </div>
+
+    <div class="status" id="status" hidden><span class="spinner"></span><span id="statusText">Routing…</span></div>
+  </main>
+</div>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

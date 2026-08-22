@@ -1,0 +1,12 @@
+fastapi==0.128.8
+networkx==3.2.1
+numpy==2.0.2
+pandas==2.3.3
+pillow==11.3.0
+pvlib==0.13.0
+pyproj==3.6.1
+rasterio==1.4.3
+requests==2.32.5
+scipy==1.13.1
+shapely==2.0.7
+uvicorn==0.39.0

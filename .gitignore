@@ -1,0 +1,23 @@
+.DS_Store
+.venv/
+__pycache__/
+data/*.geojson
+data/*.json
+data/weather_cache_*.json
+out/*.npy
+out/*.png
+# derived caches: regenerated in ~45 s by server/engine.attach_tsurf(), 166 MB each
+# as rasters. These were NOT covered by out/*.npy and 1.7 GB of them had accumulated.
+out/*.npz
+out/v2/
+out/v2_winter/
+out/v2_cold/
+!data/connectors.json
+!out/grid.json
+
+# Downloaded ground-truth tables: 172 MB, re-fetched by validate_sensors.fetch_all().
+# microclimate_sensors.csv alone is 162 MB, over GitHub's 100 MB per-file hard limit.
+data/*.csv
+# Built by scripts/build_graph.py; 18 MB each and regenerable.
+out/*.pkl
+out/*.pkl.bak
