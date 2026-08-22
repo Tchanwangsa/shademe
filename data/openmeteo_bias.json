@@ -1,0 +1,397 @@
+{
+ "kind": "openmeteo-diurnal-bias-v1",
+ "variable": "airtemperature",
+ "convention": "offset = mean(model - sensor); corrected = model - offset",
+ "shape_is_zero_mean_per_season": true,
+ "seasons": {
+  "DJF": [
+   -0.7514,
+   -0.8225,
+   -0.8211,
+   -0.8334,
+   -0.787,
+   -0.7717,
+   -0.4274,
+   0.2923,
+   0.7052,
+   0.8136,
+   0.942,
+   1.1105,
+   1.2087,
+   1.2555,
+   1.093,
+   0.7308,
+   0.1425,
+   -0.1548,
+   -0.1907,
+   -0.5092,
+   -0.6363,
+   -0.4554,
+   -0.4519,
+   -0.6814
+  ],
+  "MAM": [
+   -0.447,
+   -0.4495,
+   -0.4332,
+   -0.3913,
+   -0.2855,
+   -0.2354,
+   -0.3008,
+   -0.2355,
+   -0.0231,
+   -0.1027,
+   -0.079,
+   0.3013,
+   0.5702,
+   0.7072,
+   0.6663,
+   0.693,
+   0.6813,
+   0.5685,
+   0.0639,
+   -0.0927,
+   -0.1688,
+   -0.2485,
+   -0.2552,
+   -0.5033
+  ],
+  "JJA": [
+   -0.2204,
+   -0.2192,
+   -0.1599,
+   -0.1095,
+   -0.0889,
+   -0.023,
+   -0.0436,
+   -0.1384,
+   -0.278,
+   -0.2294,
+   -0.0793,
+   0.0833,
+   0.2681,
+   0.4102,
+   0.527,
+   0.6469,
+   0.7186,
+   0.3539,
+   -0.1134,
+   -0.2432,
+   -0.3033,
+   -0.316,
+   -0.2664,
+   -0.1763
+  ],
+  "SON": [
+   -0.8081,
+   -0.8133,
+   -0.7658,
+   -0.7345,
+   -0.6531,
+   -0.581,
+   -0.4227,
+   0.1708,
+   0.6064,
+   0.8281,
+   0.9479,
+   0.9757,
+   1.2139,
+   1.1237,
+   1.0374,
+   0.7502,
+   0.4282,
+   0.2854,
+   -0.0559,
+   -0.5437,
+   -0.6297,
+   -0.7212,
+   -0.8288,
+   -0.8098
+  ]
+ },
+ "pooled_shape": [
+  -0.5618,
+  -0.5813,
+  -0.5509,
+  -0.5242,
+  -0.4584,
+  -0.4082,
+  -0.3055,
+  0.0193,
+  0.2599,
+  0.3286,
+  0.4299,
+  0.6223,
+  0.8223,
+  0.881,
+  0.8341,
+  0.7051,
+  0.4911,
+  0.2683,
+  -0.0699,
+  -0.3422,
+  -0.4292,
+  -0.4318,
+  -0.4483,
+  -0.5501
+ ],
+ "level": -1.0004,
+ "fit": {
+  "split_date": "2025-07-01",
+  "train": [
+   "2023-06-01",
+   "2025-06-30"
+  ],
+  "test": [
+   "2025-07-01",
+   "2026-08-18"
+  ],
+  "n_train": 146794,
+  "n_test": 96435,
+  "devices": [
+   "ICTMicroclimate-01",
+   "ICTMicroclimate-02",
+   "ICTMicroclimate-03",
+   "ICTMicroclimate-04",
+   "ICTMicroclimate-05",
+   "ICTMicroclimate-06",
+   "ICTMicroclimate-07",
+   "ICTMicroclimate-08",
+   "ICTMicroclimate-09",
+   "ICTMicroclimate-10",
+   "ICTMicroclimate-11",
+   "aws5-0999"
+  ]
+ },
+ "held_out_skill": [
+  {
+   "group": "ALL",
+   "mode": "none",
+   "n": 96435,
+   "bias": -0.917,
+   "rmse": 1.6174,
+   "gain_pct": 0.0
+  },
+  {
+   "group": "ALL",
+   "mode": "pooled",
+   "n": 96435,
+   "bias": -0.9173,
+   "rmse": 1.5969,
+   "gain_pct": 1.2616
+  },
+  {
+   "group": "ALL",
+   "mode": "season",
+   "n": 96435,
+   "bias": -0.9174,
+   "rmse": 1.5786,
+   "gain_pct": 2.3941
+  },
+  {
+   "group": "ALL",
+   "mode": "season+level",
+   "n": 96435,
+   "bias": 0.083,
+   "rmse": 1.2874,
+   "gain_pct": 20.4001
+  },
+  {
+   "group": "test DJF",
+   "mode": "none",
+   "n": 22820,
+   "bias": -0.6964,
+   "rmse": 1.619,
+   "gain_pct": 0.0
+  },
+  {
+   "group": "test DJF",
+   "mode": "pooled",
+   "n": 22820,
+   "bias": -0.6965,
+   "rmse": 1.5192,
+   "gain_pct": 6.1615
+  },
+  {
+   "group": "test DJF",
+   "mode": "season",
+   "n": 22820,
+   "bias": -0.6965,
+   "rmse": 1.524,
+   "gain_pct": 5.8687
+  },
+  {
+   "group": "test DJF",
+   "mode": "season+level",
+   "n": 22820,
+   "bias": 0.3039,
+   "rmse": 1.3892,
+   "gain_pct": 14.1966
+  },
+  {
+   "group": "test MAM",
+   "mode": "none",
+   "n": 23217,
+   "bias": -0.865,
+   "rmse": 1.58,
+   "gain_pct": 0.0
+  },
+  {
+   "group": "test MAM",
+   "mode": "pooled",
+   "n": 23217,
+   "bias": -0.8658,
+   "rmse": 1.5699,
+   "gain_pct": 0.6407
+  },
+  {
+   "group": "test MAM",
+   "mode": "season",
+   "n": 23217,
+   "bias": -0.866,
+   "rmse": 1.5427,
+   "gain_pct": 2.3622
+  },
+  {
+   "group": "test MAM",
+   "mode": "season+level",
+   "n": 23217,
+   "bias": 0.1344,
+   "rmse": 1.2837,
+   "gain_pct": 18.7504
+  },
+  {
+   "group": "test JJA",
+   "mode": "none",
+   "n": 29435,
+   "bias": -1.08,
+   "rmse": 1.6533,
+   "gain_pct": 0.0
+  },
+  {
+   "group": "test JJA",
+   "mode": "pooled",
+   "n": 29435,
+   "bias": -1.0802,
+   "rmse": 1.7035,
+   "gain_pct": -3.0357
+  },
+  {
+   "group": "test JJA",
+   "mode": "season",
+   "n": 29435,
+   "bias": -1.0802,
+   "rmse": 1.6378,
+   "gain_pct": 0.9395
+  },
+  {
+   "group": "test JJA",
+   "mode": "season+level",
+   "n": 29435,
+   "bias": -0.0798,
+   "rmse": 1.2336,
+   "gain_pct": 25.3845
+  },
+  {
+   "group": "test SON",
+   "mode": "none",
+   "n": 20963,
+   "bias": -0.9858,
+   "rmse": 1.6054,
+   "gain_pct": 0.0
+  },
+  {
+   "group": "test SON",
+   "mode": "pooled",
+   "n": 20963,
+   "bias": -0.9861,
+   "rmse": 1.5541,
+   "gain_pct": 3.1972
+  },
+  {
+   "group": "test SON",
+   "mode": "season",
+   "n": 20963,
+   "bias": -0.986,
+   "rmse": 1.5918,
+   "gain_pct": 0.8445
+  },
+  {
+   "group": "test SON",
+   "mode": "season+level",
+   "n": 20963,
+   "bias": 0.0144,
+   "rmse": 1.2498,
+   "gain_pct": 22.1529
+  },
+  {
+   "group": "CBD only",
+   "mode": "none",
+   "n": 78575,
+   "bias": -1.0855,
+   "rmse": 1.6873,
+   "gain_pct": 0.0
+  },
+  {
+   "group": "CBD only",
+   "mode": "pooled",
+   "n": 78575,
+   "bias": -1.0857,
+   "rmse": 1.643,
+   "gain_pct": 2.6236
+  },
+  {
+   "group": "CBD only",
+   "mode": "season",
+   "n": 78575,
+   "bias": -1.0858,
+   "rmse": 1.6269,
+   "gain_pct": 3.5802
+  },
+  {
+   "group": "CBD only",
+   "mode": "season+level",
+   "n": 78575,
+   "bias": -0.0854,
+   "rmse": 1.2145,
+   "gain_pct": 28.0177
+  },
+  {
+   "group": "parks only",
+   "mode": "none",
+   "n": 17860,
+   "bias": -0.1755,
+   "rmse": 1.2647,
+   "gain_pct": 0.0
+  },
+  {
+   "group": "parks only",
+   "mode": "pooled",
+   "n": 17860,
+   "bias": -0.1767,
+   "rmse": 1.3762,
+   "gain_pct": -8.8169
+  },
+  {
+   "group": "parks only",
+   "mode": "season",
+   "n": 17860,
+   "bias": -0.1765,
+   "rmse": 1.3461,
+   "gain_pct": -6.4386
+  },
+  {
+   "group": "parks only",
+   "mode": "season+level",
+   "n": 17860,
+   "bias": 0.8239,
+   "rmse": 1.5683,
+   "gain_pct": -24.0104
+  }
+ ],
+ "generated": "2026-08-23T00:47:18+1000",
+ "provenance": {
+  "commit": "9e8657a",
+  "dirty": true
+ }
+}

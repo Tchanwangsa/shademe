@@ -21,3 +21,30 @@ data/*.csv
 # Built by scripts/build_graph.py; 18 MB each and regenerable.
 out/*.pkl
 out/*.pkl.bak
+
+# Provenance outputs: both are DERIVED and deliberately not stored. The digest cache is
+# keyed on (size, mtime) and rebuilds itself; the ladder results rebuild from the DSMs in
+# ~40 s. Checking a baseline in is what created the moving-yardstick problem in the first
+# place -- see the Provenance section of ENGINE_CONTRACT.md.
+out/.provenance_cache.json
+out/bench_shade_ladder*.json
+
+# The fitted Open-Meteo bias table IS checked in (~6 KB). It is derived, but it cannot be
+# regenerated from anything in this repo: the fit needs microclimate_sensors.csv, which is
+# 162 MB and excluded above. Leaving it out means a fresh clone silently serves the raw
+# uncorrected feed -- exactly the failure server/weather.py reports `bias_mode` to prevent.
+!data/openmeteo_bias.json
+
+# Hand-authored, not derived: opening hours for the protected network. Nothing in the
+# repo can regenerate it -- OSM carries opening_hours on 2 of 1232 indoor ways, so the
+# table is written by hand and losing it means the availability gate silently degrades
+# to "everything is always open", which is the bug it exists to fix.
+!data/indoor_hours.json
+
+# Shade sets generated on demand for a request date (server/engine.ensure_shade_set).
+# ~350 MB each, regenerated in ~13 s, pruned to SHADEME_SHADE_CACHE.
+out/day_*/
+# Fetched reference data for the weather-source evaluations.
+data/isd/
+data/radiation/
+data/openmeteo_sites/

@@ -304,8 +304,8 @@ def sky_emissivity(ta, rh=50.0, cloud=0.0):
     return eps_clr + (1.0 - eps_clr) * c
 
 
-def mrt(ta, svf, shade, i_dir_h, i_dif, elev_deg, tsurf,
-        t_wall=None, albedo_g=0.15, albedo_w=0.20,
+def mrt(ta, svf, shade, i_dir_h, i_dif, elev_deg, tsurf_c,
+        t_wall_c=None, albedo_g=0.15, albedo_w=0.20,
         eps_g=0.95, eps_w=0.90, eps_sky=None, rh=50.0, cloud=0.0,
         wall_sunlit=0.5):
     """Mean radiant temperature (degC) for a standing pedestrian. Vectorised.
@@ -318,9 +318,12 @@ def mrt(ta, svf, shade, i_dir_h, i_dif, elev_deg, tsurf,
               Open-Meteo's `direct_radiation`, i.e. what server/weather.py serves.
     i_dif     diffuse irradiance on the horizontal, W/m2 (`diffuse_radiation`).
     elev_deg  solar elevation above horizon, degrees. <=0 disables all shortwave.
-    tsurf     ground surface temperature, degC (out/tsurf_HH.npy is KELVIN --
-              convert before calling).
-    t_wall    wall surface temperature, degC. Defaults to `ta`.
+    tsurf_c   ground surface temperature, degC. The `_c` is load-bearing: the raster
+              on disk (out/tsurf_HH.npy) and engine.E["tsurf_k"] are both KELVIN, so
+              this argument is the one place the conversion has to have happened.
+    t_wall_c  wall surface temperature, degC. Defaults to `ta`. engine.E["twall_c"]
+              is already degC and needs no conversion -- the two live side by side in
+              the same dict in different units, which is why both carry the suffix.
     eps_sky   sky emissivity; computed from Prata via (ta, rh, cloud) if None.
 
     Returns MRT in degC, broadcast over whatever the inputs broadcast to.
@@ -331,8 +334,8 @@ def mrt(ta, svf, shade, i_dir_h, i_dif, elev_deg, tsurf,
     i_dir_h = np.asarray(i_dir_h, dtype=float)
     i_dif = np.asarray(i_dif, dtype=float)
     elev = np.asarray(elev_deg, dtype=float)
-    tsurf = np.asarray(tsurf, dtype=float)
-    t_wall = ta if t_wall is None else np.asarray(t_wall, dtype=float)
+    tsurf_c = np.asarray(tsurf_c, dtype=float)
+    t_wall_c = ta if t_wall_c is None else np.asarray(t_wall_c, dtype=float)
     if eps_sky is None:
         eps_sky = sky_emissivity(ta, rh, cloud)
 
@@ -360,8 +363,8 @@ def mrt(ta, svf, shade, i_dir_h, i_dif, elev_deg, tsurf,
     # Structure copied from SOLWEIG (Solweig1D_2023a_calc.py:284): sky through the
     # svf, wall emission through (1-svf), plus the sky reflected off the walls.
     l_sky = eps_sky * SIGMA * (ta + T0) ** 4
-    l_wall = eps_w * SIGMA * (t_wall + T0) ** 4
-    l_gnd = eps_g * SIGMA * (tsurf + T0) ** 4
+    l_wall = eps_w * SIGMA * (t_wall_c + T0) ** 4
+    l_gnd = eps_g * SIGMA * (tsurf_c + T0) ** 4
     l_down = svf * l_sky + (1.0 - svf) * l_wall + (1.0 - svf) * (1.0 - eps_w) * l_sky
     l_up = l_gnd + (1.0 - eps_g) * l_down                  # ground reflects the down flux
 

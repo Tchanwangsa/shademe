@@ -1,0 +1,67 @@
+{
+  "_README": [
+    "Availability of the protected (indoor / covered) network, by hour and weekday.",
+    "",
+    "An arcade at 21:00 is not expensive, it is SHUT. That is a hard gate, not a cost, and",
+    "it is the one property of the indoor network that does not belong in the thermal",
+    "model at all -- server/hours.py applies it by removing edges from the graph, before",
+    "any cost is computed.",
+    "",
+    "THESE HOURS ARE EDITORIAL ESTIMATES, NOT DATA. OpenStreetMap carries opening_hours on",
+    "2 of the 1232 walkable indoor ways in this extract, so there is nothing to import.",
+    "Every entry below is a plausible default chosen to make the gate behave sensibly, and",
+    "none has been checked against a published trading-hours page. verified=false says so",
+    "on every class; anything that ships as a claim about a real building has to be",
+    "checked first. The MECHANISM is correct; the COVERAGE is a data problem.",
+    "",
+    "Hours are local (Australia/Melbourne), [open, close) in decimal hours. null = shut all",
+    "day. A class with \"always\": true is never gated."
+  ],
+  "classes": {
+    "public": {
+      "label": "covered but open to the street -- awnings, arcaded footpath, bridges",
+      "always": true,
+      "verified": false
+    },
+    "station": {
+      "label": "station concourse and pedestrian subway; tied to train service",
+      "verified": false,
+      "week": {"mon": [5.0, 24.0], "tue": [5.0, 24.0], "wed": [5.0, 24.0],
+               "thu": [5.0, 24.0], "fri": [5.0, 24.0], "sat": [5.0, 24.0],
+               "sun": [6.0, 24.0]}
+    },
+    "arcade": {
+      "label": "retail arcade with doors -- Block, Royal, Centreway, Howey Place",
+      "verified": false,
+      "week": {"mon": [7.0, 18.5], "tue": [7.0, 18.5], "wed": [7.0, 18.5],
+               "thu": [7.0, 21.0], "fri": [7.0, 21.0], "sat": [9.0, 17.0],
+               "sun": [10.0, 17.0]}
+    },
+    "mall": {
+      "label": "major centre with through-routes -- Melbourne Central, Emporium, Myer, QV",
+      "verified": false,
+      "week": {"mon": [7.0, 19.0], "tue": [7.0, 19.0], "wed": [7.0, 19.0],
+               "thu": [7.0, 21.0], "fri": [7.0, 21.0], "sat": [9.0, 19.0],
+               "sun": [10.0, 19.0]}
+    }
+  },
+  "defaults": {
+    "indoor": "arcade",
+    "covered_below_ground": "station",
+    "covered": "public"
+  },
+  "places": [
+    {
+      "name": "Melbourne Central / Emporium / Myer / QV spine",
+      "class": "mall",
+      "note": "largest protected component: 307 nodes, 4.5 km, 88% indoor",
+      "bbox": [144.9610, -37.8142, 144.9652, -37.8078]
+    },
+    {
+      "name": "Flinders Street Station / Degraves and Elizabeth Street subways",
+      "class": "station",
+      "note": "second component: 305 nodes, 2.6 km, includes Campbell Arcade",
+      "bbox": [144.9645, -37.8196, 144.9682, -37.8162]
+    }
+  ]
+}

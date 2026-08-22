@@ -96,16 +96,85 @@ wind at 10 m (m/s), vapour pressure (hPa). Zero free parameters.
 Valid range: Ta -50..50, MRT-Ta -30..70, va 0.5..17 m/s. **Clamp inputs, and say so.**
 
 ## Baked into the graph (time-invariant only)
-`scripts/build_graph.py` gains one edge attr:
+`scripts/build_graph.py` gains:
 ```
-svf   float [0,1]   # mean of svf_all sampled along the edge, 0.0 for indoor/covered
-                    # (CORRECTED from 1.0: an indoor pedestrian sees NO sky. 1.0 would
-                    # hand indoor edges the coldest sky longwave as a free bonus and
-                    # invert the result in winter. The old 1.0 was the `shade` convention
-                    # -- where 1 = fully shaded -- leaking into a different quantity.)
+svf        float [0,1]  # mean of svf_all sampled along the edge, 0.0 for indoor/covered
+                        # (CORRECTED from 1.0: an indoor pedestrian sees NO sky. 1.0 would
+                        # hand indoor edges the coldest sky longwave as a free bonus and
+                        # invert the result in winter. The old 1.0 was the `shade`
+                        # convention -- 1 = fully shaded -- leaking into another quantity.)
+level      int          # building storey from `level` ALONE, never `layer`
+deck       bool         # sits on a structure: bridge tag, or level > 0
+conveying  bool         # escalator, travelator or lift -- vertical travel is nearly free
+rise_m     float        # metres climbed on this edge; 0.0 unless it is steps
+hours_key  str|None     # availability class, protected edges only (server/hours.py)
 ```
 sampled exactly like `sample_hourly()` does for `shade` (8 points per edge).
 Time-varying fields (tsurf, MRT, UTCI) are computed per request, never pickled.
+
+**Units are in the key names, and they disagree.** `engine.attach_tsurf()` sets
+`E["tsurf_k"]` in **kelvin** (it is sampled straight off `out/tsurf_HH.npy`, which the
+table above declares as K) and `E["twall_c"]` in **degrees Celsius** (it comes from
+`surface_temp.wall_effective_c`). Two temperatures, one dict, two units — hence the
+suffixes. `mrt()` takes both in Celsius (`tsurf_c`, `t_wall_c`), so `solve()` converts the
+ground term and passes the wall term through. An analysis script that reads `tsurf_k` as
+Celsius produces walls near -238 °C, which is how this was found.
+
+`rise_m` and `conveying` are **priced** as of 2026-08-23 — see *Doors and stairs* below.
+Vertical travel used to be free: the plan projection of a staircase was charged as flat
+walking, and 2865 m of climb across 1003 stepped edges cost nothing.
+
+## Vertical position: storeys, decks, and the 2.5D limit
+Three rules that used to be one, and the one was wrong.
+
+`is_indoor()` no longer treats a `level` tag as indoor. A level says where a way sits
+vertically, not whether it has walls; the old test caught 450 ways, about 5 km, that are
+open to the sky — William Barak Bridge, the Bourke Street Footbridge, QV Square,
+Melbourne Square, Menzies Alley, Albert Coates Lane — and priced every one of them as
+22.5 C conditioned interior.
+
+`storeys()` reads `level` only. `levels()` still falls back to `layer` and is used by the
+snapping guard alone. **Never read `layer` as a height:** it is a rendering z-order tag,
+569 walkable ways here carry one with no level, and treating it as a storey sent 22 km of
+ordinary footpath to `covered`.
+
+`below_ground()` sends anything with a storey under zero to `covered` — the Degraves and
+Elizabeth Street subways, Campbell Arcade, the station concourses. Enclosed, so not
+sunlit; not a shopping centre, so not `INDOOR_TA`. `covered` is exactly that middle case.
+
+**The receiver height problem.** The hourly rasters answer *is this ground cell in
+shadow*. A 2.5D height field stores one number per cell, so a walkway on a structure IS
+the terrain there and the gather returns the shadow the deck casts on the ground beneath
+itself. `dsm_buildings` holds 17.8 m at William Barak Bridge's own coordinates, and the
+bridge read shade 1.00 at every hour. Across the graph, outdoor bridge ways read 0.75
+mean shade at 14:00 against 0.22 for footpath at street level.
+
+`shadow.point_shade()` re-marches those points with the receiver raised: a blocker of
+height h at radial distance d intercepts iff `h > z0 + d*tan(el)`. At `z0 = 0` it equals
+`shade_factor()` exactly (test_shadow (g)). `z0` is read off `dsm_buildings` wherever
+there is a structure, falling back to `level * 4 m` — the DSM is preferred because a deck
+whose z0 IS its own DSM value cannot shadow itself, which is the whole bug. Applied at
+build time by `build_graph.sample_elevated()` and per weather mode at request time by
+`engine._apply_decks()`, both over the one implementation in `build_graph.deck_shade()`.
+1028 edges / 16.3 km; summer 14:00 mean shade 0.816 -> 0.147.
+
+## Opening hours (`server/hours.py`)
+A shut arcade is an **absent edge, not an expensive one**. `routing.gate()` wraps the
+weight function to return `None` for edges whose `hours_key` is closed, which networkx
+treats as a missing edge; any finite penalty would leave a large enough K free to route
+someone into a locked door. The gate applies to the shade route **and** its shortest-path
+baseline, or the difference between them would not be attributable.
+
+`/route` takes `dow` (0=Mon, default: today in Melbourne) and `respect_hours` (default
+true), and reports what it gated in `meta.availability`.
+
+Four classes — `public` (never gated), `station`, `arcade`, `mall` — assigned by curated
+bounding box, else by default: indoor -> `arcade`, below-ground covered -> `station`,
+covered -> `public`. **The hours in `data/indoor_hours.json` are editorial estimates, not
+data.** OSM carries `opening_hours` on 2 of the 1232 walkable indoor ways in this extract,
+so there is nothing to import; every class ships `verified: false`. The mechanism is
+correct, the coverage is a data problem, and no figure should be quoted as a claim about
+a real building's trading hours until someone checks one.
 
 ## File ownership during the rewrite — do not edit outside your lane
 ```
@@ -136,14 +205,136 @@ scripts/tree_heights.py  allometric canopy -> dsm_canopy_v2  (IoU 1.000000 vs v1
 scripts/surface_temp.py  semi-implicit energy balance march  (24/24 checks pass)
 scripts/mrt.py           MRT + UTCI (210 coefficients)       (0/0 failures; oracle max diff 0.087 C)
 scripts/validate_sensors.py  ground-truth harness            (Open-Meteo skill vs 12 CoM sensors)
-scripts/regen_shade_v2.py    shade rasters vs canopy v2 -> out/v2/
+scripts/regen_shade_v2.py    SHIPPED shade rasters + overlays  -> out/v2/
+scripts/provenance.py        the config stamp that every figure must carry
+scripts/bench_shade_ladder.py  rebuilds the shade ladder from the DSMs, checks both ends
+scripts/bench_indoor.py      door / K / rise / level sweeps over 40 OD pairs, one process
 server/engine.py         the integration: raster -> edges -> MRT -> UTCI -> cost
+server/routing.py        A* incl. the state-augmented search that prices transitions
 ```
+
+## Provenance — a figure without its config is not evidence
+
+Every number this project has reported was measured against a moving reference. The
+rasters in `out/shade_*.npy` were built with `RAY_STEP = 1.0` while the code on disk
+already said 0.25, so "the canopy fix changed mean shade by +4.55 pp" was really five
+stacked changes, one of them committed weeks before the session that quoted it.
+
+Two things now close that, and **both are required before any figure is quoted**.
+
+**1. `scripts/provenance.py` — the stamp.** Graph hash and size, a rollup digest over the
+shade raster set the engine actually resolves (not the one that happens to sit in `out/`),
+the SVF raster, the DSMs, the physics source hashes, `K`, `INDOOR_TA`, `TAU_LEAF`,
+`RAY_STEP`, the beam convention, the weather day and the commit. Digests are cached on
+(size, mtime), so stamping is cheap enough to do on every response.
+
+```
+graph 90ac4f4f79d3 (49065n/60868e) · shade v2 a6c381d74f68 · svf svf_veg.npy 1039ee7ed6f9
+· K=0.1 · INDOOR_TA=22.5 · TAU_LEAF=0.03 RAY_STEP=0.25 beam=hypot · day 2026-01-26 · @9e8657a
+```
+
+It is served at `GET /provenance`, returned in `meta.provenance` on every `/route`, and
+printed by the bench and the raster generator. `python scripts/provenance.py --line`
+prints the line to paste under a table.
+
+**2. `scripts/bench_shade_ladder.py` — the ladder.** The legacy raster set is NOT kept
+around as a reference to diff against; it would exist only to be compared once and would
+rot the moment anything upstream changed. Instead every rung is rebuilt from the DSMs
+through the shipped `scripts/shadow.py` — each rung is a different set of ARGUMENTS, never
+a second code path (`step`, `beam`, the canopy DSM, the crown base, `tau_leaf`) — and both
+ends are verified bit-for-bit against disk. If either anchor fails the script exits
+non-zero and nothing derived from those rasters may be quoted.
+
+```
+14:00  az 340.7  el 70.0                    mean shade      step   anchor
+  baseline on disk                              0.3058             == out/shade_14.npy
+  RAY_STEP 1.0 -> 0.25  (committed pre-session) 0.3412  +3.54 pp
+  beam height k -> hypot                        0.3363  -0.48 pp
+  allometric crown top, 8.0 -> 13.6 m           0.3421  +0.58 pp
+  crown-base slab -- the trunk gap              0.3313  -1.08 pp
+  crown blocks 1-TAU_LEAF = 0.97   SHIPPED      0.3513  +2.00 pp  == out/v2/shade_14.npy
+  NET                                                   +4.55 pp
+
+day mean 06..20   0.4756 -> 0.5117  (+3.61 pp), decomposed:
+  ray-step fix (committed pre-session)  +1.76 pp
+  beam-height fix                       -0.37 pp
+  canopy work (crown, trunk, tau)       +2.21 pp
+```
+
+Both anchors pass at all 15 hours. Re-derive with `python scripts/bench_shade_ladder.py
+--day`.
+
+**The overlay is part of the yardstick too.** `GET /shade/{hour}.png` used to serve
+`out/shade_HH.png` — the legacy set — beside a route costed off `out/v2/`. Two shade
+models on one screen, with the difference between them free to be read as a result. The
+endpoint now resolves through `engine._shade_path`, and `regen_shade_v2.py` writes the
+overlays alongside the rasters.
 
 ## Decisions
 
-**K = 0.06** (`SHADEME_K`), the single free knob. Detour-cap relaxation halves **K**,
-not six weights — `routing.route_utci()`. Cap stays 1.4x.
+**K = 0.10** (`SHADEME_K`), the single free knob, **re-swept after the door and the climb
+were priced** — until those existed K was the only thing that could hold the router out of
+the arcades, so a K sweep was measuring arcade reachability rather than shade. The sweep in
+`server/cost.py` is the current one. Two regimes: below ~0.2 K buys shade outdoors (indoor
+share flat at 2%), from ~0.22 it starts buying benefit by paying the door instead (3.9% →
+9.8% indoor between 0.20 and 0.25). 0.10 is the knee of the first regime — 0.06 → 0.10 buys
+3.2 pp of avoided stress, 0.10 → 0.20 buys 1.9 pp and opens the door. The cap still never
+binds (ratio 1.114 at K = 0.6 against a 1.4 cap). K and a systematic MRT bias remain the
+same lever, so a low K silently assumes our MRT runs hot. Detour-cap relaxation halves
+**K**, not six weights, and **not the door or the climb** — those are costs the walker
+really pays, not preferences to shed when a route runs long.
+
+**Doors and stairs are priced per transition and per metre climbed** — `cost.DOOR_PENALTY_M
+= 45 m`, `cost.RISE_M_PER_M = 3.0`, `cost.LEVEL_JUMP_M = 12 m`. An indoor edge has
+`stress = 0`, so it costs exactly its length: the floor of the cost function, which no
+outdoor edge can reach. Neither existing restraint applies — `INDOOR_TA` is not a lever
+(22.5 °C and 26.0 °C give byte-identical routes, both inside the no-stress band) and the
+1.4× detour cap cannot bind (indoor routes average ratio 1.04; an arcade is not a detour,
+it is the same corridor with a roof). So the preference is priced per **transition**, in
+metres, like a transit transfer penalty — the only shape that scales right, since a long
+arcade leg amortises it and a 40 m duck does not. Keyed on `indoor`, never `protected()`:
+an awning has no door, and charging one suppresses exactly the free shade we want used
+(covered share in route 1.5% → 0.4%, avoided stress 31.6% → 30.3%).
+
+45 m is **two costs in one number**: ~15 m of literal door (11 s of pushing through,
+escalator, wayfinding — and measurably where opportunistic ducking bottoms out) plus ~30 m
+of discount on our own indoor physics, which asserts `stress = 0` rather than modelling it.
+The right shape for that discount is per-metre, but `INDOOR_TA` cannot express it, so the
+door carries both jobs. **When the indoor model stops being a stub, drop this to 15.**
+At 45 m indoor routing is close to off — 2.0% share against a 0.7% floor — and on the demo
+pair it is total: Melbourne Central → Federation Square goes from 56.2% indoor / 67.0%
+stress avoided with a free door to 0.0% / 4.7%, because chaining five real arcade legs
+costs ten transitions. `server/cost.py` carries the sweep and the argument.
+
+Vertical: **Naismith's rule**, 600 m flat per 100 m ascent, halved to 3.0 equivalent metres
+per metre because the graph is undirected and cannot know if you are climbing or descending
+(exact over a round trip, splits the error one-way). The climb is converted to equivalent
+LENGTH and then multiplied by the thermal term — Naismith is a time rule, and stairs are
+more minutes of exposure, so a sunlit staircase should cost more than a shaded one.
+Escalators and travelators charge zero rise: OSM tags them `highway=steps` + `conveying`,
+so `conveying and rise_m > 0` is exactly the escalator set (175 edges, 724 m of rise) and
+stairs are the rest (828 edges, 2141 m). Lifts would want a wait penalty instead, but
+`highway=elevator` gives `rise_m = 0` and there are 2 in this extract. Pricing the climb at
+all is what matters; the ratio barely does — free → Naismith removes 4.2 m of unpaid climb
+per route, and quadrupling the ratio after that moves the result 0.4 pp.
+
+`LEVEL_JUMP_M` imputes one storey of climb at junctions that change `level` with **no**
+stepped or conveying edge on either side — 224 of the 490 such nodes, about half next to a
+hand-authored connector. Charging zero there was free teleportation between storeys, and it
+flattered indoor routes specifically: the router was taking 1.2 free storey changes per
+route, now 0.07. It is an imputation, not a measurement — some of those junctions are real
+unmapped stairs and some are connectors that should not exist — and the only defensible
+claim is that one storey is closer to the truth than zero.
+
+**Per-transition costs need a state-augmented search** — `routing._astar_state`, over
+`(node, indoor, level, stepped)`. `nx.astar_path`'s weight function sees one edge at a time
+and cannot know what the previous edge was, so it can only charge for being on one side of
+a door, never for crossing it. The euclidean heuristic stays **admissible** on the enlarged
+graph: every transition cost is non-negative and every edge costs at least its plan length,
+while `h` depends only on node position. The origin state is `None`, so the FIRST edge is
+never charged — we do not know whether the user is standing inside a building, and free
+either way beats wrong in one direction. This is also why an infinite door penalty does not
+mean "indoor removed": ~0.7% of route length is legs already indoors at an endpoint.
 
 **Indoor edges are modelled as AIR CONDITIONED** — `engine.INDOOR_TA = 22.5 C`
 (`SHADEME_INDOOR_TA`), MRT = air (isothermal enclosure), va = 0.5 m/s. `covered` edges get
@@ -160,6 +351,79 @@ pins `wind_speed_unit=kmh` explicitly and exposes `wind_speed_ms` alongside. The
 `vapour_pressure_hpa` (Magnus-Tetens, Sonntag 1990). Required humidity rows in both offline
 fallback tables and a `CACHE_V` bump.
 
+**Open-Meteo diurnal bias** — the feed's air temperature is corrected before anything
+reads it. Fitted by `python scripts/validate_sensors.py --fit-bias` against twelve City of
+Melbourne microclimate sensors (243k site-hours, 2023-06-01 .. 2026-08-18) and written to
+`data/openmeteo_bias.json` with its own held-out skill table. Applied in
+`weather.apply_bias()`, at the **payload** level rather than in `block()`, because
+`engine.attach_tsurf()` marches the surface and facade energy balance straight off
+`wx["hours"]` — correcting `block()` alone would run one solve on two different air
+temperatures.
+
+*What is corrected:* the SHAPE of the daily cycle only. The table is zero-mean over each
+season's 24 hours, so it redistributes the day's heat and cannot move its mean. Open-Meteo
+reads ~1.2 C cold at 03:00 and ~1.2 C warm at 13:00 relative to its own daily mean; ten of
+twelve sites agree on the sign at every hour across park, street and rooftop mounts. That
+is the nocturnal urban heat island damping the diurnal range, which a ~9 km cell cannot
+resolve — and nothing about a dozen independent instruments drifting would be synchronised
+to the clock. Per **season**, not pooled: the JJA shape is nearly the inverse of DJF in the
+morning, and a single pooled table scores **worse than no correction at all in winter**
+(-3.0% held-out RMSE) while this app ships a winter mode.
+
+*Also corrected:* the LEVEL — a flat **+1.00 C on every hour**. Open-Meteo reads 1.00 C
+cold in the daily mean, and this is **the bigger half by far**: 28.0% held-out RMSE gain
+against CBD sites versus 3.6% for the shape. A ~9 km cell averages the dense centre in with
+the parkland and suburbs around it; the centre really is warmer than that mean. The model
+is not wrong about the weather, it is wrong about *where* it is reporting the weather for.
+
+This shipped OFF at first, on the reasoning that the co-located pair at 1 Treasury Place
+disagree with *each other* by 1.0 C (`validate_sensors.PAIR_FINDING`), so a level that size
+could be one instrument's calibration. **That reasoning holds for a per-site level and does
+not survive the pooled test.** Fit the level on eleven sites and score it on the twelfth:
+it transfers to **8 of 11**. All three failures are explainable — Royal Park (+0.14 C) and
+Birrarung Marr (-0.51 C) are large parkland, and the third is the unit already known to be
+miscalibrated. Parkland *not* showing the offset is the evidence **for** a heat island;
+drift does not sort itself by land cover. The nine dense-centre sites cluster at -1.1 to
+-1.4 C.
+
+The shipped level is the all-twelve-sites figure (1.0004 C). Restricting the fit to the
+nine dense-centre sites gives 1.179 C and scores identically on held-out centre readings,
+so the pooled number is used — same accuracy, no judgement call about which sites to drop.
+`SHADEME_BIAS_LEVEL=0` drops the level and leaves the shape correction running.
+
+*Held-out skill* (fit on 2023-06-01..2025-06-30, scored on 2025-07-01..2026-08-18, RMSE C):
+
+| group | none | season shape | shape + level |
+|---|---|---|---|
+| all site-hours | 1.617 | 1.579 (+2.4%) | 1.287 (+20.4%) |
+| CBD sites only | 1.687 | 1.627 (+3.6%) | 1.215 (+28.0%) |
+| test DJF (demo season) | 1.619 | 1.524 (+5.9%) | 1.389 (+14.2%) |
+| test JJA (winter mode) | 1.653 | 1.638 (+0.9%) | 1.234 (+25.4%) |
+| the two parks | 1.265 | 1.346 (-6.4%) | 1.568 (-24.0%) |
+
+*Ride-alongs.* `apparent_temperature` is shifted 1:1 with Ta — an assumption, not a fit:
+it has no ground truth in the CoM archive, but the legacy `W_heat` is computed from it and
+leaving the pair inconsistent would be worse. `relative_humidity_2m` is re-derived at
+**constant vapour pressure** — a temperature-bias correction adds no water, so the moisture
+carries over and RH follows the new saturation point. That independently improves RH RMSE
+against the same held-out sensors (8.95 -> 8.80 %). `vapour_pressure_hpa` is invariant by
+construction. Wind is **not** corrected and must not be — see `WIND_HEIGHT_NOTE`.
+
+*Blast radius, measured.* Route geometry for the demo pair is unchanged at 09:00, 14:00
+and 18:00 in all three modes (off / shape only / shape+level), on both engines. With the
+default (shape+level) the reported values land essentially back on the raw feed — at 14:00
+the UTCI engine gives 30.20 C shortest and 26.21 C shade-aware against the raw feed's 30.19
+and 26.21, `avoided_pct` 49.5 against 49.6. **That is the practical case for the level**:
+it is the larger accuracy correction *and* it leaves already-quoted figures where they
+were, whereas shape-only moves them (29.51 / 25.84 / 50.8). `SHADEME_BIAS=0` restores the
+raw feed exactly; `scripts/test_weather_bias.py` guards the sign, the zero-mean property of
+the shape, the flatness of the level, moisture conservation and both off-switches.
+
+Measured on graph `e681d99bda9c` (49065n/60957e) with `respect_hours=false`, after the
+opening-hours graph rebuild. These are *ratios between modes*, which is what the section is
+about; the absolute figures move with the graph and should be re-measured with a
+provenance stamp rather than quoted from here.
+
 **tsurf caching** is keyed on the weather payload **plus** `material_props.json` and the
 size+mtime of `material_id.npy`, `svf_all.npy` and every shade raster. Keying on weather
 alone silently served a stale Ts across a material-property change — do not regress this.
@@ -172,6 +436,41 @@ applied hour changes. Warm route ~8 ms, hour switch ~35-50 ms, cold start ~1.4 s
 `out/`. `out/` is left intact so the Phase-2 demo keeps working.
 
 ## Known limits — state these, do not hide them
+- **The door penalty does two jobs and cannot be decomposed from route output.** 45 m is
+  ~15 m of real door plus ~30 m of distrust of `INDOOR_TA`. Nothing in a route can tell you
+  which half moved it, and the two want different shapes (per-transition vs per-metre). It
+  is the only lever available while indoor stress is asserted to be zero.
+- **There is no door value that keeps arcade legs and drops opportunistic ducking.**
+  Measured: ducking is gone by 15 m and everything above that removes legs. The choice is
+  where on that continuum to sit, not whether a clean separation exists.
+- **`LEVEL_JUMP_M` is an imputation over a mapping gap**, applied at 224 junctions that
+  change storey with no staircase mapped. 109 of them sit next to one of the 1060
+  AUTO-SNAPPED connectors (only 6 of the 1066 are hand-authored, and just 4 of these
+  junctions touch one of those), and the penalty cannot tell an unmapped stair from a
+  connector that should not exist.
+- **The shadow model has no external validation, and the only available dataset cannot
+  supply one.** Run `python scripts/validate_sensors.py --shade-lux`. It scores the shipped
+  slab model and the retired legacy model against the 2015 nine-board light archive
+  (Fitzroy Gardens + Docklands Library, 5-minute cadence) as a 2×2 contingency table, on
+  the same boards and hours, marched through `shadow.point_shade` rather than read out of
+  the 2026 demo rasters. The result: of **9587** samples with the sun above 5° and a beam
+  in the sky (DNI ≥ 400 W/m²), **zero** read shaded — the dimmest is 67.5 on a 0–100
+  channel whose 75th percentile is 94.9. `light_max == light_min == light_avg` in every row
+  of the file, so there is no within-window variance to fall back on either. With no
+  observed shaded class there is no false-alarm rate, and the surviving "hit rate" is
+  arithmetically the model's own sunlit fraction — 0.50 legacy, 0.46 slab. The residual
+  separation (modelled-sunlit samples read ~1.3 points brighter within board and elevation
+  band) **does not survive the overcast control**: beam-minus-control is +0.77 [95 % CI
+  −0.40, +3.97] for the slab and +0.20 [−4.45, +2.27] for legacy, sign test p = 0.79 and
+  1.00. Both intervals span zero, so what little the sensor sees is canopy overhead through
+  the diffuse term, not beam occlusion. Neither model is supported and neither is refuted.
+  The canopy work must not be described as externally validated; its evidence remains
+  internal consistency plus the ASU/MaRTy shade *ranking*. No CoM dataset carries a
+  non-saturating light channel or a pyranometer, so this is the ceiling.
+- **`rise_m` is direction-blind.** The graph is undirected, so a route that only descends is
+  overcharged and one that only ascends is undercharged, by half of Naismith either way.
+- **`step_count` is mapped on 278 of 848 stepped ways.** The rest fall back to the storey
+  span, then to one storey, so the 2141 m of stair rise is part measurement, part assumption.
 - **SVF at 2 m is accurate to ~0.003 on the analytic canyon**, not the ~0.07 an earlier
   note here claimed. That figure came from a bug in the validation FIXTURE (`|x| > half_w`
   put the first wall column one full cell too far out, an error that scales with cell size
@@ -213,5 +512,5 @@ applied hour changes. Warm route ~8 ms, hour switch ~35-50 ms, cold start ~1.4 s
   routing signal in summer**. That is inside SOLWEIG's own 4.8 K MRT RMSE against MaRTy
   (≈1 °C UTCI), so it is not separable from the model error we already carry. Winter noon is
   the worst case at ~26 % relative, but on stress values of only 2–3 °C.
-  If it is ever built: `mrt()` already accepts `t_wall`, so the cheap version is a closed
+  If it is ever built: `mrt()` already accepts `t_wall_c`, so the cheap version is a closed
   form in `(svf, shade, sun elevation)` — no new rasters — not the per-facet energy balance.

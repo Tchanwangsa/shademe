@@ -158,21 +158,21 @@ check("local wind wiggle stays bounded (Ta <= 35)", dv.max() < 0.5,
 rule("(c) MRT sanity")
 T = 22.0
 for svf in (0.0, 0.25, 0.5, 0.75, 1.0):
-    m = M.mrt(T, svf, 1.0, 0.0, 0.0, -10.0, T, t_wall=T,
+    m = M.mrt(T, svf, 1.0, 0.0, 0.0, -10.0, T, t_wall_c=T,
               eps_g=1.0, eps_w=1.0, eps_sky=1.0)
     check("(i) isothermal enclosure at %.0fC, svf=%.2f -> MRT=%.10f" % (T, svf, m),
           abs(m - T) < 1e-9)
-m = M.mrt(np.full(5, T), np.linspace(0, 1, 5), 1.0, 0.0, 0.0, -10.0, T, t_wall=T,
+m = M.mrt(np.full(5, T), np.linspace(0, 1, 5), 1.0, 0.0, 0.0, -10.0, T, t_wall_c=T,
           eps_g=1.0, eps_w=1.0, eps_sky=1.0)
 check("(i) vectorised isothermal, max |MRT-T| = %.2e" % np.abs(m - T).max(),
       np.abs(m - T).max() < 1e-9)
 
 # clear summer noon, Melbourne. elev 70 deg, beam 900 W/m2 normal -> ~846 horizontal.
 SUN = dict(i_dir_h=846.0, i_dif=110.0, elev_deg=70.0)
-m_sun = M.mrt(32.0, 1.0, 0.0, tsurf=52.0, rh=35, cloud=0.0, **SUN)
+m_sun = M.mrt(32.0, 1.0, 0.0, tsurf_c=52.0, rh=35, cloud=0.0, **SUN)
 check("(ii) full summer sun, svf=1, hot ground -> MRT = %.1f C (want 55..70)" % m_sun,
       55.0 <= m_sun <= 70.0)
-m_shade = M.mrt(32.0, 0.15, 1.0, tsurf=34.0, rh=35, cloud=0.0, **SUN)
+m_shade = M.mrt(32.0, 0.15, 1.0, tsurf_c=34.0, rh=35, cloud=0.0, **SUN)
 check("(iii) deep shade, svf=0.15 -> MRT = %.1f C (want <= Ta+3)" % m_shade,
       m_shade <= 35.0)
 print("  night, svf=1, ground at Ta-4: MRT = %.1f C (clear sky pulls MRT below Ta)"

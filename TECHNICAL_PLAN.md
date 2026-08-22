@@ -13,6 +13,12 @@
 
 Do **not** pitch this as "a shade app". Shade is one input to a cost function.
 
+> **This is the pre-build plan, kept as written.** It carries no measured figures — the
+> ones it does mention (the "+12% / -68%" headline, the 14 Jan demo day) were assumptions
+> and are contradicted by what shipped; `CONTRACT.md` says so explicitly. For anything
+> measured, read `ENGINE_CONTRACT.md` — its Provenance section — and quote figures only
+> with the stamp from `python scripts/provenance.py --line`.
+
 ---
 
 ## Prior art — cite it, don't hide it
@@ -206,7 +212,7 @@ A* with the cost function. FastAPI: `GET /route?from&to&time` → GeoJSON with p
 
 ### Phase 4 — Weather  (2h)
 Open-Meteo current + archive. Derive `W_heat` / `W_wet`. Cache 10 min. **Ship a "demo day"
-override** pinned to 14 Jan — you cannot record a shade demo in August, it's 9.9°C outside.
+override** pinned to 14 Jan (SHIPPED AS **2026-01-26**, `SHADEME_SUMMER_DATE`) — you cannot record a shade demo in August, it's 9.9°C outside.
 
 ### Phase 5 — Frontend  (9h)
 MapLibre GL JS, dark basemap, **vanilla JS — no build step**, you don't have time for one.

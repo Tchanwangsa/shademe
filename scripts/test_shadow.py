@@ -6,13 +6,14 @@
 (d) shade_factor levels: buildings 1.0, crown 1-TAU_LEAF, elsewhere 0.0
 (e) the building path is untouched -- a tower still casts h/tan(el)
 (f) the real rasters: how much crown shadow the trunk gap actually opens
+(g) point_shade at z0=0 equals the full-raster march; raising z0 is monotone
 """
 import os, sys
 import numpy as np
 import pandas as pd
 sys.path.insert(0, os.path.dirname(__file__))
 from config import CELL, TAU_LEAF
-from shadow import sun_position, shadow_mask, canopy_mask, shade_factor
+from shadow import sun_position, shadow_mask, canopy_mask, shade_factor, point_shade
 
 OUT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "out"))
 fails = []
@@ -113,6 +114,36 @@ else:
         check(f"{hh:02d}:00 slab is a subset of the extruded crown",
               bool((ms & ~m0).sum() == 0),
               f"{m0.sum()} -> {ms.sum()} cells ({(ms.sum()/max(m0.sum(),1)-1)*100:+.1f}%)")
+
+print("\n(g) point_shade: z0=0 matches the raster, and height only removes shade")
+H = W = 60
+pb = np.zeros((H, W), np.float32); pb[20:26, 20:26] = 25.0; pb[40:44, 10:50] = 12.0
+pt_ = np.zeros((H, W), np.float32); pt_[30:34, 30:36] = 9.0
+pbase = np.zeros((H, W), np.float32); pbase[30:34, 30:36] = 3.0
+rr, cc = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+rr, cc = rr.ravel(), cc.ravel()
+for az_, el_ in ((315.0, 35.0), (0.0, 60.0), (120.0, 20.0), (210.0, 48.0)):
+    ref = shade_factor(pb, pt_, pbase, CELL, az_, el_).ravel()
+    got = point_shade(pb, pt_, pbase, CELL, az_, el_, rr, cc, np.zeros(H * W, np.float32))
+    check(f"az={az_:.0f} el={el_:.0f} z0=0 equals shade_factor",
+          bool(np.abs(got - ref).max() == 0.0), f"max|d|={np.abs(got - ref).max():.6f}")
+prev = None
+for z in (0.0, 5.0, 10.0, 20.0, 40.0):
+    v = point_shade(pb, pt_, pbase, CELL, 315.0, 35.0, rr, cc, np.full(H * W, z, np.float32))
+    if prev is not None:
+        check(f"z0={z:.0f} m removes shade only", bool((v <= prev + 1e-6).all()),
+              f"mean {prev.mean():.4f} -> {v.mean():.4f}")
+    prev = v
+check("above the tallest blocker nothing is shaded", bool(prev.max() == 0.0))
+
+# A deck standing ON a structure must not shadow itself: z0 read off the DSM.
+deck = np.zeros((H, W), np.float32); deck[10:12, 5:55] = 18.0
+zer = np.zeros((H, W), np.float32)
+dr_, dc_ = np.full(50, 10), np.arange(5, 55)
+ondeck = point_shade(deck, zer, zer, CELL, 315.0, 35.0, dr_, dc_, deck[dr_, dc_])
+onground = point_shade(deck, zer, zer, CELL, 315.0, 35.0, dr_, dc_, np.zeros(50, np.float32))
+check("deck read at its own DSM height is unshaded by itself",
+      bool(ondeck.max() == 0.0), f"on deck {ondeck.mean():.3f} vs on ground {onground.mean():.3f}")
 
 print("\n" + "=" * 60)
 print(f"FAILURES: {len(fails)} {fails if fails else ''}")

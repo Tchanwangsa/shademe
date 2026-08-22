@@ -13,6 +13,7 @@ sys.path.insert(0, f"{ROOT}/scripts")
 from . import weather                                        # noqa: E402
 from .cost import summarise, segments, geojson, thermal_summary, compare_thermal              # noqa: E402
 from . import routing                                        # noqa: E402
+from . import hours                                          # noqa: E402
 
 HOURS = list(range(6, 21))
 DEMO_HOUR = 16
@@ -37,13 +38,19 @@ PLACES_RAW = [
 S = {}          # module state: graph, node arrays, places
 
 
-def _shade_grid(hour):
-    """Fallback path only: compute one hour's shade grid the way proto_route.py does."""
+def _shade_grid(hour, day=None):
+    """Fallback path only: compute one hour's shade grid the way proto_route.py does.
+
+    `day` used to be pinned to 2026-01-14 -- a date that appears nowhere else in the
+    codebase and is twelve days off the demo day everything else uses. It now defaults
+    to the day actually being priced.
+    """
     import pandas as pd
     from config import CELL
     from shadow import sun_position, shade_factor
     grid = json.load(open(f"{OUT}/grid.json"))
-    when = pd.Timestamp(f"2026-01-14 {hour:02d}:00", tz=weather.TZ)
+    day = day or weather.get("summer").get("date") or weather.SUMMER_DATE
+    when = pd.Timestamp(f"{day} {hour:02d}:00", tz=weather.TZ)
     az, el = sun_position(when)
     dsm_c = np.load(f"{OUT}/dsm_canopy.npy")
     # Fallback path, pinned to the v1 flat canopy: zeros == legacy crown-to-pavement.
@@ -150,10 +157,26 @@ def startup():
             print(f"[shademe] weather {m}: {weather.block(DEMO_HOUR, m)['source']}")
         except Exception as e:
             print(f"[shademe] weather {m} prewarm failed: {e}")
+    # Stamp the config ONCE at startup and hand it back on every route, so a figure
+    # screenshotted out of the app carries the graph, rasters and K that produced it.
+    # Digests are cached on (size, mtime) in out/.provenance_cache.json.
+    try:
+        import provenance as _p
+        S["prov"] = _p.line()
+        print(f"[shademe] provenance {S['prov']}")
+    except Exception as e:
+        S["prov"] = None
+        print(f"[shademe] provenance stamp failed: {e}")
 
 
 # --- v2 physical engine (additive; ?engine=utci) --------------------------------
 ENG = {}
+
+
+def _shade_key(wm, wx=None):
+    """What to hand engine as `mode`: the day being priced, else the legacy mode name."""
+    wx = wx if wx is not None else weather.get(wm)
+    return wx.get("date") or wm
 
 
 def _engine_state(mode):
@@ -164,14 +187,23 @@ def _engine_state(mode):
     """
     from . import engine as _e
     wm = "summer" if mode != "winter" else "winter"
-    wx = _e_weather = weather.get(wm)
-    key = (wm, wx.get("date"), wx.get("ts"))
+    # The bias-corrected payload, not the raw one: attach_tsurf() marches the surface and
+    # facade energy balance off wx["hours"] directly, and it has to see the same air
+    # temperature the UTCI terms in solve() see. The bias mode is in the cache key so
+    # flipping SHADEME_BIAS_LEVEL rebuilds the march instead of silently reusing it.
+    wx = weather.apply_bias(weather.get(wm))
+    # THE SHADE SET FOLLOWS THE DATE, NOT THE MODE. `wm` still selects which weather
+    # payload to price; the sun geometry comes from the day that payload is for, so an
+    # October request can no longer be costed on January shadows. engine._dirs_for()
+    # accepts a YYYY-MM-DD here and generates the set if none on disk is close enough.
+    sk = _shade_key(wm, wx)
+    key = (wm, sk, wx.get("date"), wx.get("ts"), wx.get("bias", {}).get("mode"))
     st = ENG.get(wm)
     if st and st["key"] == key:
         return st
     t0 = time.time()
-    E = _e.edge_index(S["G"], mode=wm)
-    _e.attach_tsurf(E, S["G"], wx, mode=wm)
+    E = _e.edge_index(S["G"], mode=sk)
+    _e.attach_tsurf(E, S["G"], wx, mode=sk)
     st = {"E": E, "wx": wx, "key": key, "solved": {}, "applied": None}
     ENG[wm] = st
     print(f"[shademe] engine state for {wm} built in {time.time()-t0:.1f}s")
@@ -211,11 +243,16 @@ def get_weather(hour: int = Query(None), mode: str = Query("summer")):
 def get_route(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
               hour: int = Query(None), mode: str = Query("summer"),
               compare: bool = Query(True), engine: str = Query("legacy"),
-              K: float = Query(None)):
+              K: float = Query(None), dow: int = Query(None),
+              respect_hours: bool = Query(True)):
     t0 = time.time()
     G = S["G"]
     h = _hour(hour, mode)
     w = weather.block(h, mode)
+    # Opening hours are a hard gate, not a cost: a shut arcade is an absent edge. Applied
+    # to the shade route AND its shortest-path baseline, so the two stay comparable.
+    dw = hours.now_dow() if dow is None else int(dow)
+    closed = hours.closed_keys(h, dw) if respect_hours else set()
     s, ds = nearest(from_lat, from_lon, 300.0)
     t, dt = nearest(to_lat, to_lon, 300.0)
     if s is None or t is None:
@@ -237,14 +274,14 @@ def get_route(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
             _e.apply(G, st["E"], solved)
             st["applied"] = h
         try:
-            r = routing.route_utci(G, s, t, K)
+            r = routing.route_utci(G, s, t, K, closed)
         except routing.RouteError as e:
             raise HTTPException(422, str(e))
     else:
         weights = {"w_heat": w["w_heat"], "w_wet": w["w_wet"],
                    "direct_radiation": w["direct_radiation"]}
         try:
-            r = routing.route(G, s, t, h, weights)
+            r = routing.route(G, s, t, h, weights, closed)
         except routing.RouteError as e:
             raise HTTPException(422, str(e))
     direct = w["direct_radiation"]
@@ -292,17 +329,54 @@ def get_route(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
                      "w_heat_requested": w["w_heat"],
                      "w_heat_effective": r.get("w_heat_effective"),
                      "K_effective": r.get("K_effective"),
+                     # The per-transition prices are reported next to K because they are
+                     # the other half of the same decision, and because the relaxation
+                     # loop sheds K alone: door_m and level_jump_m are what the walker
+                     # pays, not a preference we trade away when a route runs long.
+                     "door_m": r.get("door_m"), "level_jump_m": r.get("level_jump_m"),
                      "detour_ratio": r["ratio"], "detour_capped": r["capped"],
                      "relax_attempts": r["attempts"],
+                     "availability": dict(hours.describe(h, dw), enforced=respect_hours),
+                     # Additive, and deliberately on every response: any number taken out
+                     # of this API is only evidence alongside the config that made it.
+                     "provenance": S.get("prov"),
                      "ms": round((time.time() - t0) * 1000, 1)}}
 
 
 @app.get("/shade/{hour}.png")
-def shade_png(hour: int):
-    for p in (f"{OUT}/shade_{hour:02d}.png", f"{OUT}/shade_{hour}.png"):
+def shade_png(hour: int, mode: str = Query("summer")):
+    """The overlay must come from the SAME raster set the router priced the route on.
+
+    These pngs used to be served straight out of out/, which is the LEGACY set -- flat
+    8 m crowns extruded to the pavement, blocking 0.7 -- while the engine has been
+    costing edges off out/v2/. That put two different shade models on one screen and
+    invited the difference between them to be read as a result. Resolve the directory
+    through engine._shade_path so the picture and the number cannot drift apart.
+    """
+    from . import engine as _e
+    wm = "summer" if mode != "winter" else "winter"
+    cands = [_e._shade_path(hour, _shade_key(wm)).replace(".npy", ".png"),
+             f"{OUT}/shade_{hour:02d}.png", f"{OUT}/shade_{hour}.png"]
+    for p in cands:
         if os.path.exists(p):
             return FileResponse(p, media_type="image/png")
     raise HTTPException(404, f"no shade overlay for hour {hour} yet")
+
+
+@app.get("/provenance")
+def get_provenance(mode: str = Query("summer")):
+    """Which configuration produced the numbers this API is returning.
+
+    Any figure quoted from a screenshot, a demo or a doc should be quotable WITH this,
+    or it is a number against a moving reference. `line` is the compact form meant to
+    sit under a table; the rest is the full stamp.
+    """
+    import provenance as _p
+    # Stamp the set the ROUTER would resolve, not the one the legacy mode table names.
+    # Those diverge the moment a date has its own generated set, and a provenance line
+    # that names the wrong rasters is worse than none.
+    s = _p.stamp(mode=_shade_key("summer" if mode != "winter" else "winter"))
+    return {"line": _p.line(s), **s}
 
 
 @app.get("/shade/bounds.json")

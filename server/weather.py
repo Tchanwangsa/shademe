@@ -3,10 +3,17 @@ import os, json, time, requests
 
 LAT, LON = -37.8136, 144.9631
 TZ = "Australia/Melbourne"
-# Hero demo day. 26 Jan 2026 flips its own advice across the hour slider: 09:00 is 20.0C
-# and half-diffuse (W_heat 0 -> shortest route), 14:00 is 32.0C and clear (W_heat 2.1 ->
-# +18% detour, -77% sun), 18:00 is still 30.5C but the low sun already shades the direct
-# route, so it declines to detour again. Override with SHADEME_SUMMER_DATE=YYYY-MM-DD.
+# Hero demo day. 26 Jan 2026 flips its own advice across the hour slider. Apparent
+# temperature under the default correction (`season-shape[DJF]+level`), raw feed in
+# brackets:
+#   09:00  20.2 C (20.0), half-diffuse -> W_heat 0.02, effectively no heat preference
+#   14:00  31.9 C (32.0), clear        -> W_heat 2.11, the detour hour
+#   18:00  31.7 C (30.5), low sun already shades the direct route
+# Override the day with SHADEME_SUMMER_DATE=YYYY-MM-DD.
+# NO ROUTE FIGURES HERE ON PURPOSE. Route distances and UTCI deltas depend on the graph,
+# which is being rebuilt by the opening-hours work, and a figure pinned in a comment is a
+# figure that goes stale silently. Re-measure and quote with a provenance stamp instead --
+# scripts/provenance.py, and see the Provenance section of ENGINE_CONTRACT.md.
 # Hotter alternatives, both live in the archive: 2026-01-24 (35.9C), 2026-01-27 (42.8C).
 SUMMER_DATE = os.environ.get("SHADEME_SUMMER_DATE", "2026-01-26")
 VARS = ["temperature_2m", "apparent_temperature", "direct_radiation", "diffuse_radiation",
@@ -21,6 +28,47 @@ TTL = 600                            # re-fetch only if cache older than 10 min
 DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST = "https://api.open-meteo.com/v1/forecast"
+
+# --- Open-Meteo diurnal bias correction (stage 01) ------------------------------------
+# Fitted by `python scripts/validate_sensors.py --fit-bias` against twelve City of
+# Melbourne microclimate sensors, ~243k site-hours, and written to data/openmeteo_bias.json
+# with its own held-out skill table. Read that file's `held_out_skill` before quoting any
+# temperature this module returns; the docstring on fit_diurnal_bias() carries the why.
+#
+# WHAT IS CORRECTED: the SHAPE of the daily cycle only. The table is zero-mean over each
+# season's 24 hours, so it cannot move the daily mean temperature -- it redistributes it.
+# Open-Meteo's ~9 km cell resolves the synoptic day but not the city, and the city damps
+# the diurnal range: nights are held up by released heat, so the model reads ~1.2 C too
+# cold at 03:00 relative to its own daily mean and ~1.2 C too warm at 13:00. Ten of the
+# twelve sites agree on the sign at every hour, across park, street and rooftop mounts.
+# Nothing about a dozen independent instruments drifting would be synchronised to the clock.
+#
+# ALSO CORRECTED: the LEVEL, a flat +1.00 C on every hour. Open-Meteo reads 1.00 C colder
+# than the sensor network in the daily mean, and this is the bigger half of the error by
+# far -- 28.0% held-out RMSE against CBD sites, against 3.6% for the shape. A 9 km cell
+# averages the dense centre together with the parkland and suburbs around it and reports
+# the mean; the centre really is warmer than that mean. The model is not wrong about the
+# weather, it is wrong about where it is reporting the weather for.
+#
+# This was OFF at first, on the reasoning that the co-located pair at 1 Treasury Place
+# disagree with EACH OTHER by 1.0 C (validate_sensors.PAIR_FINDING), so a level that size
+# could be one instrument's calibration rather than a model error. That reasoning holds
+# for a PER-SITE level and does not survive the pooled test: fit the level on eleven sites
+# and score it on the twelfth, and it transfers to 8 of 11. All three failures are
+# explainable -- Royal Park (+0.14 C) and Birrarung Marr (-0.51 C) are large parkland, and
+# the third is the unit already known to be miscalibrated. Parkland NOT showing the offset
+# is the evidence for a heat island, not against it; instrument drift does not sort itself
+# by land cover.
+#
+# The level is the all-twelve-sites figure (1.0004 C). Restricting the fit to the nine
+# dense-centre sites gives 1.179 C and scores identically on held-out centre readings, so
+# the pooled number is used: same accuracy, no judgement call about which sites to drop.
+# SHADEME_BIAS_LEVEL=0 turns the level off and leaves the shape correction running.
+BIAS_PATH = os.path.join(DATA, "openmeteo_bias.json")
+BIAS_ON = os.environ.get("SHADEME_BIAS", "1") != "0"        # SHADEME_BIAS=0 -> raw feed
+BIAS_LEVEL = os.environ.get("SHADEME_BIAS_LEVEL", "1") != "0"   # =0 -> shape only
+SEASON_OF = {12: "DJF", 1: "DJF", 2: "DJF", 3: "MAM", 4: "MAM", 5: "MAM",
+             6: "JJA", 7: "JJA", 8: "JJA", 9: "SON", 10: "SON", 11: "SON"}
 
 # Last-resort offline table: real observed 2026-01-14 Melbourne values (Open-Meteo archive),
 # incl. the two anchor hours documented in TECHNICAL_PLAN.md (10:00 88/345/100, 16:00 558/160/3).
@@ -163,9 +211,117 @@ def vapour_pressure(t_c, rh_pct):
     return sat_vapour_pressure(t_c) * max(0.0, min(100.0, rh_pct)) / 100.0
 
 
+_bias_mem = {}
+
+
+def bias_table():
+    """The fitted correction, or None if it has not been fitted on this checkout.
+
+    Absent file is not an error: the engine runs on the raw feed and says so in the
+    block's `bias_mode`. A silently-applied correction and a silently-skipped one are the
+    same bug, so both states are reported rather than assumed.
+    """
+    if "t" not in _bias_mem:
+        try:
+            t = json.load(open(BIAS_PATH))
+            if t.get("kind") != "openmeteo-diurnal-bias-v1":
+                raise ValueError(f"unexpected bias table kind {t.get('kind')!r}")
+            _bias_mem["t"] = t
+        except Exception as e:
+            print(f"[weather] no diurnal bias correction ({e}); using the raw feed")
+            _bias_mem["t"] = None
+    return _bias_mem["t"]
+
+
+def ta_offset(hour, date):
+    """Degrees C to SUBTRACT from Open-Meteo's air temperature. (offset = model - sensor.)
+
+    Returns (offset, mode) where mode names exactly what was applied, so the caller can
+    put it in the response instead of the reader having to infer it from an env var.
+    """
+    t = bias_table()
+    if not BIAS_ON:
+        return 0.0, "off (SHADEME_BIAS=0)"
+    if t is None:
+        return 0.0, "unavailable (run: python scripts/validate_sensors.py --fit-bias)"
+    # The offline winter table carries the literal date "today", so parse defensively and
+    # fall back to the real month rather than to a hardcoded season -- a winter request
+    # silently corrected with the summer shape would be worse than no correction.
+    try:
+        month = int(str(date)[5:7])
+        assert 1 <= month <= 12
+    except Exception:
+        month = time.localtime().tm_mon
+    season = SEASON_OF[month]
+    off = float(t["seasons"][season][int(hour) % 24])
+    if BIAS_LEVEL:
+        return off + float(t["level"]), f"season-shape[{season}]+level"
+    return off, f"season-shape[{season}]"
+
+
+def apply_bias(p):
+    """A corrected COPY of a payload, with the raw hours kept alongside.
+
+    The correction is applied once, here, to the hourly rows -- not inside block(). The
+    engine does not only read block(): attach_tsurf() marches the surface and facade
+    energy balance straight off `wx["hours"]`, so correcting block() alone would leave
+    one solve running two different air temperatures, one in the convective/UTCI terms
+    and another in the longwave ones. One Ta, one place.
+
+    The disk cache stays RAW on purpose. The cache is the observation; this is a derived
+    transform of it, and a cache that already had the correction baked in could not be
+    re-corrected when the fit is re-run.
+
+    Shifted together, and why:
+      temperature_2m       the fitted quantity.
+      apparent_temperature rides Ta 1:1. An ASSUMPTION, not a fit -- Open-Meteo's
+                           apparent temperature has no ground truth in the CoM archive so
+                           it cannot be corrected on its own, but leaving it at the raw
+                           value while Ta moves would make the pair inconsistent, and the
+                           legacy W_heat is computed from it.
+      relative_humidity_2m re-derived at CONSTANT vapour pressure. A temperature-bias
+                           correction does not add or remove water; it says the air was
+                           always this warm, so the absolute moisture carries over and RH
+                           follows from the new saturation point. Not free-riding: it
+                           independently improves RH RMSE against the same held-out
+                           sensors (8.95 -> 8.80 %), a small check that the sign is right.
+    """
+    if p.get("bias") is not None:                    # already corrected, idempotent
+        return p
+    date = p.get("date", "")
+    offs, mode = {}, "off"
+    for h in p.get("hours", {}):
+        offs[int(h)], mode = ta_offset(int(h), date)
+    if not any(offs.values()):
+        q = dict(p)
+        q["bias"] = {"mode": mode, "offsets": {h: 0.0 for h in offs}, "level": BIAS_LEVEL}
+        q["hours_raw"] = p.get("hours", {})
+        return q
+    hours, raw = {}, p["hours"]
+    for h, row in raw.items():
+        h = int(h)
+        o = offs[h]
+        n = dict(row)
+        t0 = _f(row.get("temperature_2m"))
+        rh0 = row.get("relative_humidity_2m")
+        n["temperature_2m"] = t0 - o
+        if row.get("apparent_temperature") is not None:
+            n["apparent_temperature"] = _f(row["apparent_temperature"]) - o
+        if rh0 is not None:
+            vp0 = vapour_pressure(t0, float(rh0))
+            n["relative_humidity_2m"] = clamp(
+                0.0, 100.0, 100.0 * vp0 / sat_vapour_pressure(t0 - o))
+        hours[h] = n
+    q = dict(p)
+    q["hours"], q["hours_raw"] = hours, raw
+    q["bias"] = {"mode": mode, "offsets": offs, "level": BIAS_LEVEL,
+                 "table": os.path.basename(BIAS_PATH)}
+    return q
+
+
 def block(hour, mode="summer"):
     """The contract `weather` block for one hour."""
-    p = get(mode)
+    p = apply_bias(get(mode))
     hrs = p["hours"]
     h = int(hour) if int(hour) in hrs else min(hrs, key=lambda k: abs(k - int(hour)))
     r = hrs[h]
@@ -178,6 +334,15 @@ def block(hour, mode="summer"):
     # RH may be absent in a pre-v2 cache or the offline table -> fall back, but SAY so.
     rh_raw = r.get("relative_humidity_2m")
     rh = 50.0 if rh_raw is None else float(rh_raw)
+
+    raw = (p.get("hours_raw") or {}).get(h, r)
+    temp_raw, app_raw, rh_uncorr = (_f(raw.get("temperature_2m")),
+                                    _f(raw.get("apparent_temperature")),
+                                    50.0 if raw.get("relative_humidity_2m") is None
+                                    else float(raw["relative_humidity_2m"]))
+    off = float((p.get("bias") or {}).get("offsets", {}).get(h, 0.0))
+    bias_mode = (p.get("bias") or {}).get("mode", "off")
+    vp = vapour_pressure(temp, rh)
     wind_ms = wind / 3.6                       # WIND_UNIT is pinned to km/h upstream
     w_heat = clamp(0.0, 3.0, (app - 20.0) / 5.0) * direct_fraction
     w_wet = clamp(0.0, 3.0, precip * 2.0 + wind / 15.0)
@@ -188,7 +353,7 @@ def block(hour, mode="summer"):
     elif mode != "winter":
         w_wet = 0.0                              # W_wet is a winter-mode weight
     return {
-        "temperature": round(_f(r["temperature_2m"]), 1),
+        "temperature": round(temp, 1),
         "apparent_temperature": round(app, 1),
         "direct_radiation": round(direct, 1),
         "diffuse_radiation": round(diffuse, 1),
@@ -199,7 +364,12 @@ def block(hour, mode="summer"):
         "wind_speed_ms": round(wind_ms, 2),              # m/s at 10 m -- use this for physics
         "relative_humidity": round(rh, 1),
         "rh_is_fallback": rh_raw is None,
-        "vapour_pressure_hpa": round(vapour_pressure(temp, rh), 2),
+        "vapour_pressure_hpa": round(vp, 2),             # invariant under the correction
+        "ta_bias_offset": round(off, 3),                 # degC SUBTRACTED from the feed
+        "bias_mode": bias_mode,
+        "temperature_raw": round(temp_raw, 1),           # what Open-Meteo actually said
+        "apparent_temperature_raw": round(app_raw, 1),
+        "relative_humidity_raw": round(rh_uncorr, 1),
         "direct_fraction": round(direct_fraction, 3),
         "w_heat": round(w_heat, 3),
         "w_wet": round(w_wet, 3),

@@ -39,7 +39,7 @@ DEFAULT_RH = 50.0           # %, only used if the weather row carries no humidit
 # want of a facade energy balance, which made every MRT in the model biased low -- a
 # sun-facing masonry wall in a Melbourne heatwave runs well above screen temperature.
 # wall_march() below now solves the same balance on a VERTICAL facet, per orientation,
-# and mrt() takes the result through the `t_wall` argument it always had. Nothing new
+# and mrt() takes the result through the `t_wall_c` argument it always had. Nothing new
 # was added to the MRT formula: (1-svf)*l_wall was already there, and this only
 # substitutes a better temperature into that existing slot, so it cannot double count.
 

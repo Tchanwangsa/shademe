@@ -1,3 +1,26 @@
+> **PROVENANCE — read before quoting anything below.**
+>
+> This is a session record from commit `2a7cd3e` (*"before the physics fixes"*), written
+> before `scripts/provenance.py` existed. Its figures were **not stamped**, so the exact
+> raster set and graph behind each one cannot be recovered from the text — that is the
+> whole reason the stamp now exists.
+>
+> What that means in practice:
+>
+> - **Shade figures here are superseded.** The canopy work landed in `9e8657a` after this
+>   was written, and the ladder in `scripts/bench_shade_ladder.py` re-derives all of it
+>   from the DSMs with both ends checked against disk. Quote the ladder, not this.
+> - **SVF, wall-facet and MRT sensitivity figures still stand** — they are analytic or
+>   closed-form results about the model's structure (`dUTCI/dSVF`, the anti-correlation
+>   between wall weight and sunlit fraction), not measurements against a raster, so a
+>   raster change does not move them.
+> - **Anything with a route distance or a UTCI delta in it is stale by construction.**
+>   The current pinned figures live in `CONTRACT.md` under "Demo route that MUST work",
+>   with the stamp attached.
+>
+> Re-derive with `python scripts/bench_shade_ladder.py --day` and
+> `python scripts/provenance.py --line`.
+
 I'll dig into the actual code before answering — the canopy blend question and the wall-temperature question both hinge on what's really there.
 
 Now let me quantify both questions with the actual model rather than argue about them.
