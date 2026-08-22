@@ -28,14 +28,20 @@ ALBEDO_ENV = 0.20           # bulk albedo of surrounding walls. Oke (1987) Table
 REFL_F = 0.5                # walls are vertical: they intercept roughly half the
                             # global HORIZONTAL irradiance we use as their driver.
 EPS_WALL = 0.90             # longwave emissivity of brick/concrete walls (Oke 1987).
-WALL_DT = 0.0               # wall temperature = Ta + WALL_DT. See module note below.
+WALL_DT = 0.0               # LEGACY fallback only. See "wall temperature" below: walls
+                            # now get their own energy balance in wall_march(), and this
+                            # constant survives only for callers that have no solar
+                            # geometry to hand.
 DEFAULT_SHADE = 1.0         # for hours with no shade raster (sun is down anyway).
 DEFAULT_RH = 50.0           # %, only used if the weather row carries no humidity.
 
-# NOTE ON WALL TEMPERATURE. We have no wall energy balance yet, so walls radiate at
-# air temperature (WALL_DT = 0). That is the standard first-order closure and it is
-# conservative: real sunlit walls run 5-15 K hot, so canyon cells come out slightly
-# COOL here. Raise WALL_DT once mrt.py has a facade temperature to hand back.
+# NOTE ON WALL TEMPERATURE. Walls used to radiate at air temperature (WALL_DT = 0) for
+# want of a facade energy balance, which made every MRT in the model biased low -- a
+# sun-facing masonry wall in a Melbourne heatwave runs well above screen temperature.
+# wall_march() below now solves the same balance on a VERTICAL facet, per orientation,
+# and mrt() takes the result through the `t_wall` argument it always had. Nothing new
+# was added to the MRT formula: (1-svf)*l_wall was already there, and this only
+# substitutes a better temperature into that existing slot, so it cannot double count.
 
 # --- material property defaults (material_props.json overrides per id) ---------
 DEF_PROPS = dict(albedo=0.20, emissivity=0.95, rho_c_d=1.5e5, beta=0.0, k_deep=0.0)
@@ -195,11 +201,21 @@ def absorbed(f, shade, svf, alb, eps, albedo_env=ALBEDO_ENV, refl_f=REFL_F,
 
     S_down = direct (already horizontal, gated by shade) + diffuse (scaled by SVF)
              + reflected off the (1-SVF) of the hemisphere that is wall.
-    L_in   = SVF * L_sky + (1-SVF) * eps_wall sigma (Ta + wall_dt)^4.
+    L_in   = SVF * L_sky
+             + (1-SVF) * [ eps_wall sigma (Ta + wall_dt)^4 + (1-eps_wall) L_sky ]
+
+    THE REFLECTED TERM IS NOT OPTIONAL. A wall with eps_wall = 0.90 also REFLECTS 10%
+    of the sky longwave falling on it, and that reflection reaches the ground. Dropping
+    it (as this function did until the wall balance was added) breaks the isothermal
+    enclosure identity: put sky, walls and ground all at the same temperature and the
+    ground still shows a net radiative deficit of (1-svf)(1-eps_wall) sigma T^4, about
+    23 W m-2 in an svf=0.35 canyon, which cools it by a couple of kelvin. mrt.py always
+    had this term (`(1 - svf) * (1 - eps_w) * l_sky` in its l_down); the two agree now.
     """
     g = f["s_dir"] + f["s_dif"]
     sw = f["s_dir"] * (1.0 - shade) + f["s_dif"] * svf + albedo_env * refl_f * (1.0 - svf) * g
-    l_in = svf * f["l_sky"] + (1.0 - svf) * eps_wall * SIGMA * (f["ta_k"] + wall_dt) ** 4
+    l_wall = eps_wall * SIGMA * (f["ta_k"] + wall_dt) ** 4 + (1.0 - eps_wall) * f["l_sky"]
+    l_in = svf * f["l_sky"] + (1.0 - svf) * l_wall
     return (1.0 - alb) * sw + eps * l_in
 
 
@@ -319,6 +335,146 @@ def march(shade_by_hour, svf, mat_id, props, weather_hours, hours=range(6, 21),
         diag.update(spin=spin, dt=dt, t_deep=t_deep,
                     forcing={h: Fi[h] for h in clock})
     return out
+
+
+# ==============================================================================
+# walls: the same balance on a VERTICAL facet
+# ==============================================================================
+# A facade differs from pavement in four ways, all of them in this section and none of
+# them a new equation:
+#   1. GEOMETRY. The beam hits a vertical surface at cos(elev)*cos(az_sun - az_wall),
+#      so a facade is sunlit for part of the day and shaded for the rest purely by which
+#      way it faces. Marching all eight orientations therefore produces the sunlit AND
+#      the shaded facade temperature at every hour with no extra parameter.
+#   2. SKY VIEW. An unobstructed vertical surface sees half sky and half ground, hence
+#      WALL_SVF = 0.5 on both the diffuse and the longwave terms.
+#   3. MASS. Masonry is heavier than the participating layer of a road: rho_c_d from the
+#      admittance of concrete/brick rather than asphalt.
+#   4. A BACK SIDE. A wall conducts to conditioned indoor air, which is the main reason
+#      facades do not reach pavement temperatures. That is k_deep/t_deep in net_flux(),
+#      already supported -- for the ground they default to off.
+WALL_ORIENT = np.arange(0.0, 360.0, 45.0)   # azimuth each facade FACES, degrees from N
+WALL_SVF = 0.5              # unobstructed vertical surface: half sky, half ground
+WALL_RHO_C_D = 2.5e5        # J m-2 K-1. Oke (1987) Table 2.1 admittance: brick ~1150,
+                            # concrete ~1780 -> 1.9e5..2.9e5 by rho_c_d = 165.8*mu.
+                            # The CBD is a mix of solid masonry and curtain wall.
+WALL_K_DEEP = 1.5           # W m-2 K-1 through the wall to indoor air. Solid masonry
+                            # U ~ 2.0, insulated/modern ~ 0.5; 1.5 is the mixed stock.
+WALL_T_INDOOR = 22.5        # degC. Same stated assumption as engine.INDOOR_TA.
+WALL_WIND_F = 0.6           # facades sit inside the canopy: knock the wind down.
+WALL_ALBEDO_G = 0.15        # ground albedo seen by the lower half of the facade.
+
+
+def wall_absorbed(f, az_sun, elev, orient=WALL_ORIENT, albedo=ALBEDO_ENV,
+                  eps=EPS_WALL, wall_svf=WALL_SVF, albedo_g=WALL_ALBEDO_G,
+                  t_env_k=None):
+    """Ts-independent half of the facade balance, W m-2, one value per orientation.
+
+    t_env_k  temperature of the lower hemisphere the wall faces (ground + opposing
+             facades), K. Defaults to air. Pass the mean ground Ts from march() to
+             couple the two one way -- ground warms the wall, not the reverse.
+    """
+    orient = np.asarray(orient, float)
+    day = elev > 0.0
+    sinb = max(np.sin(np.radians(elev)), np.sin(np.radians(2.0))) if day else 1.0
+    i_dn = (f["s_dir"] / sinb) if day else 0.0          # horizontal -> beam-normal
+    # incidence on a VERTICAL surface; negative means the facade faces away from the sun
+    cos_inc = (np.cos(np.radians(elev)) *
+               np.cos(np.radians(az_sun - orient))) if day else np.zeros_like(orient)
+    cos_inc = np.clip(cos_inc, 0.0, None)
+    g = f["s_dir"] + f["s_dif"]
+    sw = i_dn * cos_inc + wall_svf * f["s_dif"] + (1.0 - wall_svf) * albedo_g * g
+    # Lower hemisphere: the ground EMITS eps sigma T^4 and REFLECTS (1-eps) of the sky
+    # falling on it. Both reach the facade. Without the reflected half the isothermal
+    # enclosure does not close -- see test_surface_temp.py (j)(i).
+    t_env_k = f["ta_k"] if t_env_k is None else float(t_env_k)
+    l_env = eps * SIGMA * t_env_k ** 4 + (1.0 - eps) * f["l_sky"]
+    l_in = wall_svf * f["l_sky"] + (1.0 - wall_svf) * l_env
+    return (1.0 - albedo) * sw + eps * l_in
+
+
+def wall_march(weather_hours, sun_by_hour, orient=WALL_ORIENT, hours=range(6, 21),
+               albedo=ALBEDO_ENV, eps=EPS_WALL, rho_c_d=WALL_RHO_C_D,
+               k_deep=WALL_K_DEEP, t_indoor_c=WALL_T_INDOOR, wall_svf=WALL_SVF,
+               wind_f=WALL_WIND_F, albedo_g=WALL_ALBEDO_G, t_env_k=None,
+               spin_loops=3, n_sub=12, wind_unit="kmh", rh_default=DEFAULT_RH):
+    """Facade temperature by orientation. -> {hour: (n_orient,) float64 array in K}.
+
+    sun_by_hour  {hour: (azimuth_deg, elevation_deg)}, e.g. from shadow.sun_position.
+    t_env_k      {hour: K} ground temperature the facade sees, or a scalar, or None.
+
+    Scalars, not rasters: eight orientations by twenty-four hours is 192 numbers, so
+    this costs nothing next to the 6M-cell ground march. Same substep() and net_flux()
+    as the ground -- only the absorbed term and the material properties differ.
+    """
+    orient = np.asarray(orient, float)
+    F = {h: forcing(weather_hours[h], wind_unit, rh_default) for h in sorted(weather_hours)}
+    clock = sorted(F)
+    t_deep = t_indoor_c + 273.15
+
+    def env(h):
+        """Ground temperature the facade faces at hour h, K, or None for air.
+
+        A dict keyed on only the daylight hours is normal -- the ground rasters are only
+        sampled over HOURS -- so an hour outside it falls back to the NEAREST hour that
+        is present rather than dropping to air temperature, which would put a step in
+        the facade's environment at dawn and dusk.
+        """
+        if t_env_k is None:
+            return None
+        if not isinstance(t_env_k, dict):
+            return float(t_env_k)
+        if h in t_env_k:
+            return float(t_env_k[h])
+        if not t_env_k:
+            return None
+        return float(t_env_k[min(t_env_k, key=lambda k: abs(k - h))])
+
+    # Absorbed flux per hour first, THEN averaged onto the interval. Averaging the solar
+    # geometry itself would have to average azimuths across the 0/360 wrap; averaging the
+    # resulting flux does not, and it is the flux the march actually integrates.
+    Q = {h: wall_absorbed(F[h], *sun_by_hour.get(h, (0.0, -90.0)), orient=orient,
+                          albedo=albedo, eps=eps, wall_svf=wall_svf,
+                          albedo_g=albedo_g, t_env_k=env(h)) for h in clock}
+    Qi = {h: 0.5 * (Q[h] + Q[clock[(i + 1) % len(clock)]]) for i, h in enumerate(clock)}
+    Hi = {h: 0.5 * (h_conv(wind_f * F[h]["u_surf"]) +
+                    h_conv(wind_f * F[clock[(i + 1) % len(clock)]]["u_surf"]))
+          for i, h in enumerate(clock)}
+    Ti = {h: 0.5 * (F[h]["ta_k"] + F[clock[(i + 1) % len(clock)]]["ta_k"])
+          for i, h in enumerate(clock)}
+
+    dt = 3600.0 / n_sub
+    ts = np.full(orient.shape, F[clock[0]]["ta_k"], float)
+    want, out = set(hours), {}
+    for loop in range(max(1, spin_loops)):
+        last = loop == max(1, spin_loops) - 1
+        for hh in clock:
+            if last and hh in want:
+                out[hh] = ts.copy()
+            for _ in range(n_sub):
+                ts = substep(ts, Qi[hh], eps, rho_c_d, Hi[hh], Ti[hh], dt,
+                             k_deep, t_deep, 0.0)
+    return out
+
+
+def wall_effective_c(ts_orient_k, weights=None):
+    """One facade temperature for the MRT longwave term, degC.
+
+    MRT's wall term is eps sigma T^4, so the average that preserves the emitted flux is
+    the QUARTIC mean, not the arithmetic one. With a sunlit facade at +24 K and a shaded
+    one at +5 K the two differ by about 1 K, always in the direction of the hot facade.
+
+    STATED ASSUMPTION: `weights` defaults to uniform, i.e. a pedestrian sees facades of
+    every orientation equally. That is roughly true on an open street corner and wrong
+    in a canyon, where two orientations dominate and one of them is usually the shaded
+    one. Pass weights to model a specific street axis. This is the crudest step in the
+    wall chain and the one to replace first if facade orientation ever gets computed
+    per cell from the building DSM.
+    """
+    t = np.asarray(ts_orient_k, float)
+    w = np.ones(t.shape[-1]) if weights is None else np.asarray(weights, float)
+    w = w / w.sum()
+    return float((np.sum(w * t ** 4, axis=-1)) ** 0.25) - 273.15
 
 
 def save_hourly(ts, hour, outdir="out", prefix="tsurf"):

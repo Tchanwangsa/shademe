@@ -42,6 +42,53 @@ CLASS_COEF = {
 }
 DEFAULT_CLASS = "evergreen_medium"
 
+# --- crown base (height to the base of the live crown) -------------------------
+# A tree is a crown on a stick, and the stick is what lets a low sun shine UNDER the
+# canopy. scripts/shadow.py needs the bottom of that crown, not just its top, or every
+# crown gets extruded to the pavement and the 7 am / 6 pm beam is blocked at knee
+# height. So this module emits a second raster, dsm_canopy_base_v2.npy.
+#
+# CrnBase is measured directly by the same Urban Tree Database used for H(DBH) above
+# (TS3_Raw_tree_data.csv; TreeHt = CrnBase + CrnHt holds exactly, so it is metres to the
+# base of the live crown), on the same five Mediterranean-climate Californian regions
+# (InlEmp, InlVal, NoCalC, SacVal, SoCalC).
+#
+# WHY LINEAR IN H AND NOT A CONSTANT CROWN RATIO. corr(CrnBase, H) is +0.44..+0.80 but
+# corr(CrnBase/H, H) is NEGATIVE for every non-palm class: crown base rises with the tree
+# but SUBLINEARLY, so a fixed ratio over-lifts tall trees. The linear fit beats the
+# median-ratio model on RMSE in all six classes (e.g. large_broadleaf 1.65 m vs 1.76 m).
+#
+# READ THE R2 BEFORE TRUSTING A SINGLE TREE. Crown base is genuinely scattered -- R2 is
+# 0.19-0.29 for the broadleaf classes, i.e. this predicts the POPULATION mean well and an
+# individual tree poorly (RMSE 1.1-1.7 m). That is the right precision for an aggregate
+# shade statistic over 60k edges and the wrong precision for "is this bench in shade".
+CBH_COEF = {
+    #                    m       c        n     R2    RMSE   p95(CrnBase/H)
+    "large_broadleaf": (0.1448,  1.3336),  # 1619  0.229  1.65   0.50
+    "eucalypt":        (0.3487, -0.1599),  #  133  0.637  2.90   0.60
+    "conifer":         (0.1247,  0.7946),  #  397  0.285  1.76   0.40
+    "evergreen_medium":(0.1364,  1.5689),  # 1262  0.190  1.24   0.60
+    "small_tree":      (0.1708,  1.1401),  #  484  0.196  1.08   0.60
+    "palm":            (0.8667, -2.4822),  #   97  0.878  2.11   0.89
+}
+CBH_MAX_RATIO = 0.90   # a crown is never less than 10% of the tree. Only ever binds on
+                       # palms (p95 of CrnBase/H = 0.89); every other class p95 <= 0.60.
+
+
+def crown_base(h, cls):
+    """Height to the base of the live crown, m. Vectorised over (h, cls) arrays.
+
+    Clamped to [0, CBH_MAX_RATIO * h] so the crown always has positive depth.
+    """
+    h = np.asarray(h, dtype=float)
+    cls = np.asarray(cls)
+    m = np.full(h.shape, CBH_COEF[DEFAULT_CLASS][0])
+    c = np.full(h.shape, CBH_COEF[DEFAULT_CLASS][1])
+    for k, (mk, ck) in CBH_COEF.items():
+        sel = cls == k
+        m[sel], c[sel] = mk, ck
+    return np.clip(m * h + c, 0.0, CBH_MAX_RATIO * h)
+
 def _cls(genera, name):
     return {g: name for g in genera.split()}
 
@@ -239,9 +286,26 @@ if __name__ == "__main__":
           f"{far.mean()*100:.1f}% beyond {NEAR_RADIUS:.0f} m -> polygon height")
     vals = np.where(far, dsm[rr, cc], near_h).astype(np.float32)
     dsm = np.zeros((hgt, w), dtype=np.float32)
-    dsm[rr, cc] = np.clip(vals, H_MIN, H_MAX)
+    top = np.clip(vals, H_MIN, H_MAX)
+    dsm[rr, cc] = top
     np.save(os.path.join(OUT, "dsm_canopy_v2.npy"), dsm)
     print(f"  saved out/dsm_canopy_v2.npy {dsm.shape} {dsm.dtype}")
+
+    # --- crown base, the trunk gap the low sun shines through ------------------
+    # Same per-cell provenance as the top: a cell inside NEAR_RADIUS takes its nearest
+    # tree's class, a cell beyond it fell back to a polygon height and so has no tree to
+    # take a class from -- DEFAULT_CLASS, consistent with load_trees().
+    cls_cell = np.where(far, DEFAULT_CLASS, cls[idx])
+    base = np.zeros((hgt, w), dtype=np.float32)
+    base[rr, cc] = crown_base(top, cls_cell).astype(np.float32)
+    np.save(os.path.join(OUT, "dsm_canopy_base_v2.npy"), base)
+    b = base[rr, cc]
+    print(f"  saved out/dsm_canopy_base_v2.npy  crown base over covered cells: "
+          f"mean {b.mean():.2f} med {np.median(b):.2f} "
+          f"p5 {np.percentile(b,5):.2f} p95 {np.percentile(b,95):.2f} m")
+    print(f"  crown depth (top-base): mean {(top-b).mean():.2f} m, "
+          f"min {(top-b).min():.2f} m; base above z_ped=1.1 m on "
+          f"{(b > 1.1).mean()*100:.1f}% of covered cells")
 
     print("== validation ==")
     old = np.load(os.path.join(OUT, "dsm_canopy.npy"))

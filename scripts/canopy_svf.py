@@ -42,14 +42,15 @@ import os, sys, time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
-from config import CELL
+from config import CELL, TAU_LEAF     # TAU_LEAF is shared with shadow.py -- see config.py
 
 OUT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "out"))
 
 Z_PED = 1.1        # same reference height as svf.py -- these two must not drift apart
 R_M = 40.0         # neighbourhood radius. dF falls as 1/R^4: a full 2 m ring of canopy
                    # at 40 m contributes < 0.008, and beyond 60 m < 0.002. See _tail().
-TAU_LEAF = 0.03    # SOLWEIG default transmissivity of light through vegetation (3%)
+                   # TAU_LEAF (SOLWEIG leaf-on transmissivity, 3%) now lives in
+                   # config.py so shadow.py uses the SAME constant. Imported above.
 
 
 def blocking(canopy, buildings, cell=CELL, z_ped=Z_PED, r_m=R_M, verbose=False):

@@ -21,7 +21,7 @@ print(f"{WHEN}  ->  azimuth {az:.1f}deg  elevation {el:.1f}deg")
 print(f"a 297m tower should cast {297/np.tan(np.radians(el)):.0f}m of shadow")
 
 t = time.time()
-shade = shade_factor(dsm_b, dsm_c, CELL, az, el)
+shade = shade_factor(dsm_b, dsm_c, np.zeros_like(dsm_c), CELL, az, el)  # v1 proto: no crown base
 print(f"shade computed in {time.time()-t:.1f}s   {(shade>0).mean()*100:.1f}% of grid shaded")
 
 # --- geometric verification: walk from Eureka along the anti-sun vector ---

@@ -45,8 +45,12 @@ def _shade_grid(hour):
     grid = json.load(open(f"{OUT}/grid.json"))
     when = pd.Timestamp(f"2026-01-14 {hour:02d}:00", tz=weather.TZ)
     az, el = sun_position(when)
-    sh = shade_factor(np.load(f"{OUT}/dsm_buildings.npy"),
-                      np.load(f"{OUT}/dsm_canopy.npy"), CELL, az, el)
+    dsm_c = np.load(f"{OUT}/dsm_canopy.npy")
+    # Fallback path, pinned to the v1 flat canopy: zeros == legacy crown-to-pavement.
+    # The served rasters are out/v2/, built by scripts/regen_shade_v2.py with the
+    # real crown base from out/dsm_canopy_base_v2.npy.
+    sh = shade_factor(np.load(f"{OUT}/dsm_buildings.npy"), dsm_c,
+                      np.zeros_like(dsm_c), CELL, az, el)
     return sh, grid
 
 

@@ -21,7 +21,7 @@ print("computing shade grid ...")
 dsm_b = np.load(f"{OUT}/dsm_buildings.npy"); dsm_c = np.load(f"{OUT}/dsm_canopy.npy")
 grid  = json.load(open(f"{OUT}/grid.json"))
 az, el = sun_position(WHEN)
-shade = shade_factor(dsm_b, dsm_c, CELL, az, el)
+shade = shade_factor(dsm_b, dsm_c, np.zeros_like(dsm_c), CELL, az, el)  # v1 proto: no crown base
 
 print("building graph ...")
 G = build(shade, grid)

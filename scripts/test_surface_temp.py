@@ -316,9 +316,74 @@ def t_i_bench():
     print("        in ~270 MB; keep=True would add 15 x 24.2 = 363 MB on top.")
 
 
+def t_j_wall():
+    """The vertical-facet balance: geometry, the isothermal limit, and the quartic mean."""
+    print("\n(j) walls -- vertical facet energy balance")
+    w = summer_day()
+    sun = {h: (float(np.degrees(np.arctan2(1, 1)) * 0 + (60.0 + 15.0 * (h - 6))),
+               float(max(-10.0, 70.0 * np.sin(np.pi * (h - 6.0) / 14.0))))
+           for h in range(24)}          # azimuth sweeping E->W, elevation an arch
+
+    # (i) isothermal enclosure: no sun at all, sky and ground both at air temperature,
+    # and no conduction -> every orientation must settle at exactly air temperature.
+    flat = {h: row(25.0, 0.0, 0.0, 100.0, 10.0) for h in range(24)}   # overcast, dark
+    W = st.wall_march(flat, {h: (180.0, -20.0) for h in range(24)}, hours=range(24),
+                      k_deep=0.0, t_env_k=25.0 + 273.15, spin_loops=6)
+    err = max(abs(float(v.max()) - 298.15) for v in W.values())
+    check("(i) isothermal enclosure -> Twall == Ta", err < 0.05, f"max |dT| = {err:.4f} K")
+
+    # (ii) with cloud=100 the sky radiates as a black body at Ta, so an unlit facade
+    # over ground at Ta has no net radiation either -- the same limit, reached from the
+    # all-orientations march rather than a single facet.
+    spread = max(float(v.max() - v.min()) for v in W.values())
+    check("(ii) no beam -> no spread across orientations", spread < 1e-6,
+          f"max spread {spread:.2e} K")
+
+    # (iii) the facade facing the sun must beat the one facing away, every daylight hour.
+    W = st.wall_march(w, sun, hours=range(8, 19))
+    bad = []
+    for h, v in W.items():
+        az, el = sun[h]
+        if el <= 5.0:
+            continue
+        cos_inc = np.cos(np.radians(el)) * np.cos(np.radians(az - st.WALL_ORIENT))
+        if cos_inc.max() <= 0:
+            continue
+        if v[np.argmax(cos_inc)] <= v[np.argmin(cos_inc)]:
+            bad.append(h)
+    check("(iii) sun-facing facade hotter than sun-averted", not bad, f"failed at {bad}")
+
+    # (iv) magnitude: a sunlit masonry facade should run well above air but nowhere near
+    # pavement. Reported as a RANGE check, because there is no local measurement of this.
+    ta = {h: st._f(w[h]["temperature_2m"]) for h in W}
+    hot = max(float(v.max()) - 273.15 - ta[h] for h, v in W.items())
+    cold = min(float(v.min()) - 273.15 - ta[h] for h, v in W.items())
+    check("(iv) peak sunlit facade in 5..30 K over air", 5.0 <= hot <= 30.0,
+          f"hottest {hot:+.1f} K, coldest {cold:+.1f} K over air")
+
+    # (v) the quartic mean is the flux-preserving average, so it never sits below the
+    # arithmetic one, and the two coincide when every orientation is equal.
+    v = np.array([300.0, 305.0, 310.0, 296.0, 298.0, 302.0, 315.0, 299.0])
+    q = st.wall_effective_c(v) + 273.15
+    check("(v) quartic mean >= arithmetic mean", q >= v.mean() - 1e-9,
+          f"quartic {q:.3f} K vs arithmetic {v.mean():.3f} K (+{q - v.mean():.3f})")
+    flat_v = np.full(8, 303.0)
+    check("(v) equal orientations -> the two agree",
+          abs(st.wall_effective_c(flat_v) + 273.15 - 303.0) < 1e-9)
+
+    # (vi) conduction to indoor air must pull a hot facade DOWN and a cold one UP.
+    hot_day = {h: row(40.0, 0.0, 0.0, 100.0, 10.0) for h in range(24)}
+    a = st.wall_march(hot_day, {h: (180.0, -20.0) for h in range(24)}, hours=[12],
+                      k_deep=0.0, t_env_k=40.0 + 273.15)[12].mean()
+    b = st.wall_march(hot_day, {h: (180.0, -20.0) for h in range(24)}, hours=[12],
+                      k_deep=3.0, t_indoor_c=22.5, t_env_k=40.0 + 273.15)[12].mean()
+    check("(vi) k_deep to 22.5 C cools a 40 C facade", b < a - 0.5,
+          f"{a - 273.15:.2f} C -> {b - 273.15:.2f} C with conduction")
+
+
 if __name__ == "__main__":
     for t in (t_a_steady_state, t_b_night, t_c_step_size, t_d_inertia, t_e_shade,
-              t_f_energy, t_g_spinup, t_h_shape_and_io, t_i_bench):
+              t_f_energy, t_g_spinup, t_h_shape_and_io, t_j_wall, t_i_bench):
         t()
     print("\n" + ("ALL PASS" if not FAIL else f"{len(FAIL)} FAILED: {FAIL}"))
     sys.exit(1 if FAIL else 0)

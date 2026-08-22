@@ -18,6 +18,8 @@ from shadow import sun_position
 import pandas as pd
 
 OUT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "out"))
+SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
+PHYSICS_SRC = ("surface_temp.py", "mrt.py", "shadow.py")
 HOURS = list(range(6, 21))
 TZ = "Australia/Melbourne"
 N_SAMPLE = 8
@@ -152,7 +154,12 @@ def _key(wx_hours, date, mode="summer"):
            "mat": _file_sig(f"{OUT}/material_id.npy"),
            "svf": [_svf_path(), _file_sig(_svf_path() or "")],
            "mode": mode,
-           "shade": [_file_sig(_shade_path(h, mode)) for h in HOURS]}
+           "shade": [_file_sig(_shade_path(h, mode)) for h in HOURS],
+           # The PHYSICS is an input too. Editing surface_temp.py or mrt.py changes Ts
+           # and MRT without touching a single raster, and the cache would happily serve
+           # the old answer -- which is how a grey-body longwave fix nearly went
+           # unmeasured. Hash the modules that actually compute the march.
+           "code": [_file_sig(os.path.join(SCRIPTS, f)) for f in PHYSICS_SRC]}
     return hashlib.sha256(json.dumps(sig, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
@@ -221,8 +228,13 @@ def solve(E, wx_block, wx_full, hour, K=0.06, g=None):
     shade = E["shade"][hi].astype(np.float64)
     prot = E["indoor"] | E["covered"]
 
+    # Facade temperature for MRT's (1-svf)*l_wall term. Falls back to air only when the
+    # wall march has not run (no attach_tsurf yet) -- that fallback IS the old bias, so
+    # it is worth knowing which branch a number came from.
+    t_wall = E.get("twall", {}).get(int(hour))
     tmrt = MRT.mrt(ta=ta, svf=svf, shade=shade, i_dir_h=i_dir, i_dif=i_dif,
-                   elev_deg=elev, tsurf=tsurf_c, albedo_g=alb_g, rh=rh, cloud=cloud)
+                   elev_deg=elev, tsurf=tsurf_c, t_wall=t_wall,
+                   albedo_g=alb_g, rh=rh, cloud=cloud)
     # protected edges: no beam, no sky -> isothermal enclosure at the local air temp
     ta_e = np.where(E["indoor"], INDOOR_TA, ta)
     tmrt = np.where(prot, ta_e, tmrt)
@@ -234,7 +246,45 @@ def solve(E, wx_block, wx_full, hour, K=0.06, g=None):
     mult = 1.0 + K * s
     return {"mrt": tmrt, "utci": u, "stress": s, "mult": mult, "shade": shade,
             "cost": E["length"] * mult, "clamped": clamped,
-            "ta_edge": ta_e, "elev": elev}
+            "ta_edge": ta_e, "elev": elev,
+            "t_wall": ta if t_wall is None else float(t_wall)}
+
+
+def wall_temps(wx, t_env_k=None):
+    """{hour: effective facade temperature in degC} for MRT's longwave wall term.
+
+    Closes the "walls radiate at air temperature" bias: surface_temp.WALL_DT was 0 and
+    mrt() defaulted t_wall to ta, so every facade in the (1-svf) hemisphere emitted at
+    screen temperature. This marches the same energy balance on a vertical facet for
+    eight orientations and collapses them with the QUARTIC mean, which is the average
+    that preserves emitted flux.
+
+    t_env_k  {hour: K} the ground temperature each facade faces. One-way coupling: hot
+             pavement warms the wall, and the wall does not feed back into the ground
+             march. Without it a shaded facade radiates to a cold sky over a lower
+             hemisphere at air temperature and comes out BELOW air, which is wrong --
+             it is looking at 50 C asphalt in reality.
+    """
+    hrs = wx["hours"]
+    hrs = {int(k): v for k, v in hrs.items()}
+    date = wx.get("date", "2026-01-26")
+    sun = {h: sun_position(pd.Timestamp(f"{date} {h:02d}:00", tz=TZ)) for h in hrs}
+    W = ST.wall_march(hrs, sun, hours=HOURS, t_env_k=t_env_k)
+    return {h: ST.wall_effective_c(v) for h, v in W.items()}
+
+
+def _attach_walls(E, wx, mode=None):
+    """Sets E['twall'][hour] -> effective facade temperature, degC.
+
+    The ground temperature the facades see is the mean over OUTDOOR edges: indoor and
+    covered edges carry conditioned or sheltered air, not sunlit pavement, and folding
+    them in would cool the environment a facade radiates against.
+    """
+    out = E["tsurf"]
+    outdoor = ~(E["indoor"] | E["covered"])
+    env = {h: float(v[outdoor].mean()) if outdoor.any() else float(v.mean())
+           for h, v in out.items()}
+    E["twall"] = wall_temps(wx, t_env_k=env)
 
 
 def attach_tsurf(E, G, wx, g=None, mode="summer", cache=True):
@@ -255,6 +305,7 @@ def attach_tsurf(E, G, wx, g=None, mode="summer", cache=True):
     if cache and os.path.exists(path):
         z = np.load(path)
         E["tsurf"] = {int(k): z[k].astype(np.float64) for k in z.files}
+        _attach_walls(E, wx, mode)
         return E["tsurf"]
     ts = surface_temps(wx, g, mode=mode)
     take = _sampler(G, E["edges"], g)
@@ -269,6 +320,7 @@ def attach_tsurf(E, G, wx, g=None, mode="summer", cache=True):
     if cache:
         np.savez_compressed(path, **{str(k): v.astype(np.float32)
                                      for k, v in E["tsurf"].items()})
+    _attach_walls(E, wx, mode)
     return E["tsurf"]
 
 

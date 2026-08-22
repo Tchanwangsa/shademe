@@ -59,7 +59,10 @@ if __name__ == "__main__":
         t0 = time.time()
         when = pd.Timestamp(f"{DAY} {hh:02d}:00", tz=TZ)
         az, el = sun_position(when)
-        shade = shade_factor(dsm_b, dsm_c, CELL, az, el)
+        # v1 path: flat 8 m canopy, no crown-base raster exists for it. Zeros ==
+        # the legacy crown-to-pavement model. The live rasters come from
+        # scripts/regen_shade_v2.py, which passes the real crown base.
+        shade = shade_factor(dsm_b, dsm_c, np.zeros_like(dsm_c), CELL, az, el)
         np.save(f"{OUT}/shade_{hh:02d}.npy", shade)
         to_png(shade).save(f"{OUT}/shade_{hh:02d}.png", optimize=True)
         m = float(shade.mean())
