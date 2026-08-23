@@ -1,4 +1,4 @@
-"""Single-node surface energy balance, marched hourly over the shade rasters.
+"""Single-node surface energy balance, marched over the shade rasters.
 
     rho_c_d dTs/dt = (1-a) S_down + eps L_in - eps sigma Ts^4 - h(u) (Ts - Ta)
 
@@ -27,7 +27,11 @@ WALL_DT = 0.0               # LEGACY fallback. Walls used to radiate at air temp
                             # which biased every MRT low; wall_march() below now solves
                             # their own balance and mrt() takes it via `t_wall_c`. This
                             # survives only for callers with no solar geometry to hand.
-DEFAULT_SHADE = 1.0         # for hours with no shade raster (sun is down anyway)
+DEFAULT_SHADE = 1.0         # for slots with no shade raster (sun is down anyway)
+SUB_DT = 300.0              # target integration step, s. The clock's spacing divided by
+                            # n_sub; with n_sub=None the march picks n_sub to hit this,
+                            # so refining the clock does NOT refine dt and the
+                            # accumulation integral is unchanged across that move.
 DEFAULT_RH = 50.0           # %, only if the weather row carries no humidity
 
 # --- material property defaults (material_props.json overrides per id) ---------
@@ -214,24 +218,34 @@ def _shade_at(src, hour, shape, default=DEFAULT_SHADE):
 
 
 def march(shade_by_hour, svf, mat_id, props, weather_hours, hours=range(6, 21),
-          spin_loops=3, n_sub=12, keep=True, on_hour=None, wind_unit="kmh",
+          spin_loops=3, n_sub=None, keep=True, on_hour=None, wind_unit="kmh",
           rh_default=DEFAULT_RH, t_deep=None, diag=None, **cfg):
-    """March the energy balance around the 24 h clock. -> {hour: Ts float32 (h,w) in K}.
+    """March the energy balance around the 24 h clock. -> {key: Ts float32 (h,w) in K}.
 
-    shade_by_hour  dict{hour: (h,w) float32 shade} or callable(hour) -> array|None.
-                   Hours with no raster get DEFAULT_SHADE.
+    THE CLOCK'S UNIT IS WHATEVER THE CALLER KEYS `weather_hours` WITH. This marches over
+    sorted(weather_hours) and never interprets a key, so 24 keys of 0..23 is an hourly
+    clock and 48 keys of timegrid.CLOCK is a half-hourly one. What it does read off the
+    keys is HOW MANY there are: the clock is one whole day, so its spacing is
+    86400/len(clock) seconds. That is the only place the step enters.
+
+    shade_by_hour  dict{key: (h,w) float32 shade} or callable(key) -> array|None.
+                   Keys with no raster get DEFAULT_SHADE.
     svf            (h,w) float32 sky view factor.   mat_id  (h,w) uint8 class ids.
     props          {id: {albedo, emissivity, rho_c_d, ...}} from material_props.json.
-    weather_hours  {0..23: Open-Meteo row}, i.e. api.weather.get()["hours"].
-    hours          which hours to emit.  spin_loops  diurnal repeats before emitting.
-    n_sub          sub-steps per hour. Accuracy only, not stability.
+    weather_hours  {key: Open-Meteo row} covering a whole day, uniformly spaced.
+    hours          which keys to emit.  spin_loops  diurnal repeats before emitting.
+    n_sub          sub-steps per CLOCK STEP. None picks it so dt lands on SUB_DT, which
+                   is what keeps the integration identical when the clock is refined --
+                   hourly/12 and half-hourly/6 are both dt=300 s. Accuracy only, never
+                   stability: substep() is unconditionally stable.
     keep           hold results in the returned dict. False + on_hour = streaming.
-    on_hour        callback(hour, ts) as each requested hour is reached.
+    on_hour        callback(key, ts) as each requested key is reached.
     diag           optional dict, filled with per-loop max |dTs| and dt.
     cfg            albedo_env, refl_f, eps_wall, wall_dt, z_ped, z0, default_shade.
 
     Peak RAM is ~11 rasters: ~0.3 GB on the real grid with keep=False, +363 MB with
-    keep=True, so stream on the real grid.
+    keep=True, so stream on the real grid. A half-hourly clock emits 29 rasters instead
+    of 15, which is 700 MB held: stream that one.
     """
     default_shade = cfg.pop("default_shade", DEFAULT_SHADE)
     z_ped, z0 = cfg.pop("z_ped", Z_PED), cfg.pop("z0", KARMAN_Z0)
@@ -250,13 +264,18 @@ def march(shade_by_hour, svf, mat_id, props, weather_hours, hours=range(6, 21),
 
     F = {h: forcing(weather_hours[h], wind_unit, rh_default, z_ped, z0)
          for h in sorted(weather_hours)}
-    clock = sorted(F)                                       # normally 0..23
+    clock = sorted(F)                       # 0..23 hourly, or timegrid.CLOCK at 30 min
     Fi = {h: _mean_forcing(F[h], F[clock[(i + 1) % len(clock)]])
           for i, h in enumerate(clock)}
     if t_deep is None:
         t_deep = float(np.mean([F[h]["ta_k"] for h in clock]))
 
-    dt = 3600.0 / n_sub
+    # The clock is a whole day however finely it is cut, so its step follows from its
+    # length. Deriving it here rather than hardcoding 3600 is what lets api.engine move
+    # to half-hour slots without silently halving dt underneath the accumulation.
+    step_s = 86400.0 / len(clock)
+    n_sub = max(1, int(round(step_s / SUB_DT))) if n_sub is None else int(n_sub)
+    dt = step_s / n_sub
     ts = np.full(svf.shape, F[clock[0]]["ta_k"], np.float32)
     want = set(hours)
     out = {}
@@ -279,7 +298,7 @@ def march(shade_by_hour, svf, mat_id, props, weather_hours, hours=range(6, 21),
             ts = ts.astype(np.float32, copy=False)
         spin.append(float(np.max(np.abs(ts - prev))))
     if diag is not None:
-        diag.update(spin=spin, dt=dt, t_deep=t_deep,
+        diag.update(spin=spin, dt=dt, n_sub=n_sub, step_s=step_s, t_deep=t_deep,
                     forcing={h: Fi[h] for h in clock})
     return out
 
@@ -336,11 +355,14 @@ def wall_march(weather_hours, sun_by_hour, orient=WALL_ORIENT, hours=range(6, 21
                albedo=ALBEDO_ENV, eps=EPS_WALL, rho_c_d=WALL_RHO_C_D,
                k_deep=WALL_K_DEEP, t_indoor_c=WALL_T_INDOOR, wall_svf=WALL_SVF,
                wind_f=WALL_WIND_F, albedo_g=WALL_ALBEDO_G, t_env_k=None,
-               spin_loops=3, n_sub=12, wind_unit="kmh", rh_default=DEFAULT_RH):
-    """Facade temperature by orientation. -> {hour: (n_orient,) float64 array in K}.
+               spin_loops=3, n_sub=None, wind_unit="kmh", rh_default=DEFAULT_RH):
+    """Facade temperature by orientation. -> {key: (n_orient,) float64 array in K}.
 
-    sun_by_hour  {hour: (azimuth_deg, elevation_deg)}, e.g. from shadow.sun_position.
-    t_env_k      {hour: K} ground temperature the facade sees, a scalar, or None.
+    Keyed in whatever unit the caller clocks `weather_hours` with, exactly as march() is
+    -- hours or timegrid slots -- and dt follows the clock's spacing the same way.
+
+    sun_by_hour  {key: (azimuth_deg, elevation_deg)}, e.g. from shadow.sun_position.
+    t_env_k      {key: K} ground temperature the facade sees, a scalar, or None.
 
     Scalars, not rasters: 8 orientations x 24 hours is 192 numbers. Same substep() and
     net_flux() as the ground -- only the absorbed term and the properties differ.
@@ -353,7 +375,7 @@ def wall_march(weather_hours, sun_by_hour, orient=WALL_ORIENT, hours=range(6, 21
     def env(h):
         """Ground temperature the facade faces at hour h, K, or None for air.
 
-        A dict keyed only on daylight hours is normal, so an absent hour falls back to
+        A dict keyed only on daylight slots is normal, so an absent key falls back to
         the NEAREST present one rather than to air, which would step at dawn and dusk.
         """
         if t_env_k is None:
@@ -378,7 +400,12 @@ def wall_march(weather_hours, sun_by_hour, orient=WALL_ORIENT, hours=range(6, 21
     Ti = {h: 0.5 * (F[h]["ta_k"] + F[clock[(i + 1) % len(clock)]]["ta_k"])
           for i, h in enumerate(clock)}
 
-    dt = 3600.0 / n_sub
+    # The clock is a whole day however finely it is cut, so its step follows from its
+    # length. Deriving it here rather than hardcoding 3600 is what lets api.engine move
+    # to half-hour slots without silently halving dt underneath the accumulation.
+    step_s = 86400.0 / len(clock)
+    n_sub = max(1, int(round(step_s / SUB_DT))) if n_sub is None else int(n_sub)
+    dt = step_s / n_sub
     ts = np.full(orient.shape, F[clock[0]]["ta_k"], float)
     want, out = set(hours), {}
     for loop in range(max(1, spin_loops)):

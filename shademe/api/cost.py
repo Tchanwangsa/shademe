@@ -1,4 +1,5 @@
 """Edge cost + route summarisation. Pure functions, no I/O."""
+from .. import timegrid as TG      # pure constants and arithmetic; keeps the no-I/O rule
 
 WALK_MPS = 1.35
 NO_STRESS_HI = 26.0      # upper edge of the UTCI no-thermal-stress band; see mrt.stress()
@@ -189,12 +190,17 @@ def compare_uv(chosen, shortest):
             "uv_dose_avoided_pct": round((base - got) / base * 100.0, 1) if base > 0.01 else None}
 
 
-def edge_shade(d, hour):
-    """Shade in [0,1] for this edge at `hour`.
+def edge_shade(d, when):
+    """Shade in [0,1] for this edge at `when` (a timegrid slot, or an hour).
 
-    `_shade` is the transient value engine.apply() stashed for the currently applied hour
+    `_shade` is the transient value engine.apply() stashed for the currently applied slot
     AND shade set. It must win over the pickled `shade` dict, which was baked with one
     day's shadows -- reporting those on another day's route mixes the two silently.
+
+    The pickled dict is keyed in WHOLE HOURS and the router now asks in half-hour slots,
+    so both sides are put on the slot grid before the nearest-key search. Comparing 810
+    against keys 6..20 directly would have quietly returned 20:00 for every afternoon
+    walk -- the fallback is rare, but a rare wrong answer is the expensive kind.
     """
     t = d.get("_shade")
     if t is not None:
@@ -203,13 +209,11 @@ def edge_shade(d, hour):
     if isinstance(s, dict):
         if not s:
             return 0.0
-        h = int(hour)
-        if h in s:
-            return float(s[h])
-        if str(h) in s:                      # survives a json round-trip
-            return float(s[str(h)])
-        k = min(s, key=lambda k: abs(int(k) - h))
-        return float(s[k])
+        slot = TG.as_slot(when)
+        for k in (slot, str(slot), TG.hour_of(slot), str(TG.hour_of(slot))):
+            if k in s:                       # str() survives a json round-trip
+                return float(s[k])
+        return float(s[min(s, key=lambda k: abs(TG.as_slot(int(k)) - slot))])
     return float(s)
 
 
@@ -310,7 +314,8 @@ def compare_thermal(chosen, shortest):
     Percentages are None inside the comfort band rather than a suspicious 0.0.
 
     THE UI LEADS WITH `stress_load_avoided`, NOT the percentage. Measured over 40 pairs
-    (tools/bench_hours.py, summer, K=0.10, door 45 m):
+    (tools/bench_hours.py, summer, K=0.10, door 45 m, HOURLY shade grid -- these predate
+    the move to 30-minute slots, so re-run before quoting the digits):
 
         hour   baseline degC-min   avoided degC-min   avoided pct
           10                25.6               14.9         58.2

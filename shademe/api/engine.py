@@ -17,11 +17,14 @@ from ..physics import surface_temp as ST
 from ..physics import mrt as MRT
 from ..physics.shadow import sun_position
 from ..paths import OUT
+from .. import timegrid as TG
 from . import uv as UV
 
 PHYSICS_SRC = ("surface_temp.py", "mrt.py", "shadow.py")
 PHYSICS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "physics"))
-HOURS = list(range(6, 21))
+# The time grid is timegrid's, not this module's: the generator, the march and the router
+# have to agree on it exactly, and one of them owning the list is how that stays true.
+SLOTS = TG.SLOTS
 TZ = "Australia/Melbourne"
 N_SAMPLE = 8
 
@@ -50,9 +53,13 @@ SHADE_DIRS = {"summer": ["v2", ""], "winter": ["v2_winter", "v2", ""],
 # what makes the choice automatic. The manual switch defaulted to summer and was never
 # derived from the date, so an October request was priced on 26 January shadows -- about
 # 56% too short.
+# TWO TESTS, NOT ONE. A set fits a request when its noon elevation is close enough AND
+# it was generated at a step at least as fine as the one being asked for. Without the
+# second test an hourly set from before the half-hour move would answer a 13:30 request
+# off its 13:00 raster and nothing would say so.
 SHADE_TOL_DEG = float(os.environ.get("SHADEME_SHADE_TOL", "2.0"))   # noon-elevation slack
 SHADE_GEN = os.environ.get("SHADEME_SHADE_GEN", "1") == "1"         # generate if none fits
-SHADE_CACHE_MAX = int(os.environ.get("SHADEME_SHADE_CACHE", "3"))   # generated sets kept
+SHADE_CACHE_MAX = int(os.environ.get("SHADEME_SHADE_CACHE", "2"))   # generated sets kept
 GEN_PREFIX = "day_"
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -63,10 +70,12 @@ def _noon_elev(day):
 
 
 def _sets_on_disk():
-    """{dirname: day} for every shade set present, read from each set's own manifest.
+    """{dirname: (day, step_min)} for every shade set present, from each set's manifest.
 
     Read rather than tabulated: the sun positions a set was built with are a property of
-    the files, not of a mapping kept here that can drift away from them.
+    the files, not of a mapping kept here that can drift away from them. A manifest with
+    no `step_min` predates the half-hour grid and is therefore hourly -- the absence is
+    the answer, so it is not a guess.
     """
     out = {}
     for d in sorted(os.listdir(OUT)):
@@ -74,27 +83,47 @@ def _sets_on_disk():
         if not os.path.isdir(os.path.join(OUT, d)) or not os.path.exists(p):
             continue
         try:
-            day = json.load(open(p)).get("day")
+            m = json.load(open(p))
         except (ValueError, OSError):
             continue
-        if day and os.path.exists(os.path.join(OUT, d, f"shade_{HOURS[0]:02d}.npy")):
-            out[d] = day
+        day, step = m.get("day"), int(m.get("step_min") or 60)
+        first = os.path.join(OUT, d, f"shade_{TG.hhmm(SLOTS[0])}.npy")
+        legacy = os.path.join(OUT, d, f"shade_{TG.hour_of(SLOTS[0]):02d}.npy")
+        if day and (os.path.exists(first) or os.path.exists(legacy)):
+            out[d] = (day, step)
     return out
 
 
-def _best_set(day):
-    """(dirname, day, elevation gap) of the closest set on disk, or (None, None, inf)."""
+def _best_set(day, step=None):
+    """(dirname, day, elevation gap) of the closest USABLE set, or (None, None, inf).
+
+    Sets coarser than `step` are still returned when nothing finer exists -- they are the
+    fallback when generation is off or fails -- but ensure_shade_set() checks the step
+    itself and regenerates, so a coarse set is never quietly treated as a fitting one.
+    """
+    step = TG.STEP_MIN if step is None else int(step)
     want = _noon_elev(day)
     best, bday, gap = None, None, float("inf")
-    for d, dday in _sets_on_disk().items():
+    fine = {d: v for d, v in _sets_on_disk().items() if v[1] <= step}
+    for d, (dday, _st) in (fine or _sets_on_disk()).items():
         g = abs(_noon_elev(dday) - want)
         if g < gap:
             best, bday, gap = d, dday, g
     return best, bday, gap
 
 
+def _set_step(d):
+    """The step a set on disk was generated at, in minutes."""
+    return _sets_on_disk().get(d, (None, 60))[1]
+
+
 def _prune_generated(keep):
-    """Bound the disk cost of on-demand sets. Each one is ~350 MB of float32 raster."""
+    """Bound the disk cost of on-demand sets. Each one is ~680 MB of float32 raster.
+
+    Was 3 sets at ~350 MB; the half-hour grid doubled the per-set size, so the default
+    count came down to 2 to keep the ceiling near where it was. Two is still enough for
+    the case that matters -- today, plus the day either side of a midnight rollover.
+    """
     gen = [d for d in os.listdir(OUT)
            if d.startswith(GEN_PREFIX) and os.path.isdir(os.path.join(OUT, d))]
     gen = [d for d in gen if d != keep]
@@ -111,17 +140,22 @@ def ensure_shade_set(day):
     the march in the engine is how you end up with two shade models in one process.
     """
     d, dday, gap = _best_set(day)
-    if d is not None and gap <= SHADE_TOL_DEG:
+    step = _set_step(d) if d is not None else None
+    if d is not None and gap <= SHADE_TOL_DEG and step <= TG.STEP_MIN:
         return d
     if not SHADE_GEN:
-        print(f"[shade] {day}: closest set {d} is {gap:.1f} deg off at noon, "
+        why = (f"{gap:.1f} deg off at noon" if gap > SHADE_TOL_DEG
+               else f"generated at {step} min, coarser than {TG.STEP_MIN}")
+        print(f"[shade] {day}: closest set {d} is {why}, "
               f"generation disabled -- using it anyway")
         return d
     name = f"{GEN_PREFIX}{day}"
-    if os.path.exists(os.path.join(OUT, name, f"shade_{HOURS[-1]:02d}.npy")):
+    if os.path.exists(os.path.join(OUT, name, f"shade_{TG.hhmm(SLOTS[-1])}.npy")):
         return name
-    print(f"[shade] {day}: closest set {d} ({dday}) is {gap:.1f} deg off at noon "
-          f"-> generating {name}")
+    why = (f"{gap:.1f} deg off at noon" if gap > SHADE_TOL_DEG
+           else f"hourly, and this request needs {TG.STEP_MIN} min")
+    print(f"[shade] {day}: closest set {d} ({dday}) is {why} -> generating {name} "
+          f"({len(SLOTS)} slots)")
     t0 = time.time()
     r = subprocess.run([sys.executable, "-m", "shademe.pipeline.shade", day, name],
                        capture_output=True, text=True)
@@ -136,19 +170,30 @@ def ensure_shade_set(day):
 
 
 def _dirs_for(mode):
-    """Ordered candidate directories for a mode name OR a YYYY-MM-DD day."""
+    """Ordered candidate directories for a mode name OR a YYYY-MM-DD day."""  # noqa: D401
     if isinstance(mode, str) and _DATE_RE.match(mode):
         d = ensure_shade_set(mode)
         return ([d] if d else []) + ["v2", ""]
     return SHADE_DIRS.get(mode, SHADE_DIRS["summer"])
 
 
-def _shade_path(hour, mode="summer"):
+def _shade_path(slot, mode="summer"):
+    """Raster for one slot. Falls back to the containing hour on a pre-slot set.
+
+    The fallback exists so a checkout whose out/ was built before the half-hour grid still
+    runs instead of crashing on a missing file. It is not a silent downgrade: a set that
+    only has whole hours fails the step test in ensure_shade_set() and is regenerated, so
+    this is reached only when generation is off or has failed, which prints.
+    """
+    slot = int(slot)
+    names = [f"shade_{TG.hhmm(slot)}.npy",                  # this slot
+             f"shade_{TG.hour_of(slot):02d}.npy"]           # the containing hour, coarse
     for d in _dirs_for(mode):
-        p = os.path.join(OUT, d, f"shade_{hour:02d}.npy") if d else f"{OUT}/shade_{hour:02d}.npy"
-        if os.path.exists(p):
-            return p
-    return f"{OUT}/shade_{hour:02d}.npy"
+        for n in names:
+            p = os.path.join(OUT, d, n) if d else f"{OUT}/{n}"
+            if os.path.exists(p):
+                return p
+    return f"{OUT}/{names[-1]}"
 
 
 # Which SVF raster the engine reads. svf_veg is svf_bldg with the canopy's TRUE
@@ -232,12 +277,12 @@ def _apply_decks(G, edges, E, g, mode):
     from ..pipeline import graph as BG
     idx = {e: i for i, e in enumerate(edges)}
     try:
-        vals, _z = BG.deck_shade(G, deck, g, _raster_day(mode), HOURS)
+        vals, _z = BG.deck_shade(G, deck, g, _raster_day(mode), SLOTS)
     except (OSError, ValueError) as e:
         print(f"[engine] deck re-sample skipped ({e})")
         return
     cols = np.array([idx[e] for e in deck])
-    for i in range(len(HOURS)):
+    for i in range(len(SLOTS)):
         E["shade"][i, cols] = vals[i]
 
 
@@ -253,10 +298,10 @@ def edge_index(G, mode="summer"):
         "length": np.array([float(x["length"]) for x in d], dtype=np.float64),
         "indoor": np.array([bool(x.get("indoor")) for x in d]),
         "covered": np.array([bool(x.get("covered")) for x in d]),
-        "shade": np.zeros((len(HOURS), n), dtype=np.float32),
+        "shade": np.zeros((len(SLOTS), n), dtype=np.float32),
     }
-    for i, h in enumerate(HOURS):
-        E["shade"][i] = take(np.load(_shade_path(h, mode), mmap_mode="r"))
+    for i, sl in enumerate(SLOTS):
+        E["shade"][i] = take(np.load(_shade_path(sl, mode), mmap_mode="r"))
     _apply_decks(G, edges, E, g, mode)
     svf_p = _svf_path()
     if svf_p:
@@ -297,7 +342,11 @@ def _key(wx_hours, date, mode="summer"):
            "mat": _file_sig(f"{OUT}/material_id.npy"),
            "svf": [_svf_path(), _file_sig(_svf_path() or "")],
            "mode": mode,
-           "shade": [_file_sig(_shade_path(h, mode)) for h in HOURS],
+           # The grid itself is an input: an hourly march and a half-hourly one over the
+           # same weather are different numbers and must not share a cache entry.
+           "step": TG.STEP_MIN,
+           "slots": list(SLOTS),
+           "shade": [_file_sig(_shade_path(sl, mode)) for sl in SLOTS],
            "code": [_file_sig(os.path.join(PHYSICS_DIR, f)) for f in PHYSICS_SRC]}
     return hashlib.sha256(json.dumps(sig, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
@@ -310,8 +359,25 @@ def _key(wx_hours, date, mode="summer"):
 RASTER_CACHE = os.environ.get("SHADEME_TSURF_RASTER", "0") == "1"
 
 
+def _clock(wx):
+    """{slot: weather row} over the whole 24 h, at timegrid's step.
+
+    One accessor so the ground march, the wall march and solve() cannot end up clocked
+    differently. weather.slot_rows() is where the 15-minute radiation is joined on.
+    """
+    from . import weather as _w
+    return _w.slot_rows(wx)
+
+
 def surface_temps(wx, g, cache=None, mode="summer"):
-    """{hour: Ts raster (K)} for the whole grid. The march is ~33 s."""
+    """{slot: Ts raster (K)} for the whole grid. The march is ~38 s.
+
+    Half-hourly now, and that costs no march time: the clock's step halved but
+    surface_temp.SUB_DT holds the integration at dt=300 s either way, so this walks the
+    same number of substeps and integrates the same accumulation. What doubles is the
+    number of rasters EMITTED -- 29 instead of 15, ~700 MB if kept -- which is why the
+    edge cache in attach_tsurf() is the one that ships and this one stays opt-in.
+    """
     cache = RASTER_CACHE if cache is None else cache
     key = _key(wx["hours"], wx.get("date", "?"), mode)
     path = f"{OUT}/tsurf_cache_{key}.npz"
@@ -323,8 +389,8 @@ def surface_temps(wx, g, cache=None, mode="summer"):
     mat = (np.load(f"{OUT}/material_id.npy") if os.path.exists(f"{OUT}/material_id.npy")
            else np.zeros((g["h"], g["w"]), dtype=np.uint8))
     props = json.load(open(f"{OUT}/material_props.json"))
-    shade = {h: np.load(_shade_path(h, mode), mmap_mode="r") for h in HOURS}
-    ts = ST.march(shade, svf, mat, props, wx["hours"], hours=HOURS, keep=True)
+    shade = {sl: np.load(_shade_path(sl, mode), mmap_mode="r") for sl in SLOTS}
+    ts = ST.march(shade, svf, mat, props, _clock(wx), hours=SLOTS, keep=True)
     if cache:
         np.savez_compressed(path, **{str(k): v for k, v in ts.items()})
     return ts
@@ -337,8 +403,8 @@ def _props_vec(props, key, default):
     return v
 
 
-def solve(E, wx_block, wx_full, hour, K=None, g=None):
-    """Per-edge UTCI, stress and cost multiplier for one hour.
+def solve(E, wx_block, wx_full, slot, K=None, g=None):
+    """Per-edge UTCI, stress and cost multiplier for one SLOT (timegrid minutes).
 
     K is imported from cost.K_DEFAULT rather than defaulted here: it used to default to
     0.06 while the router used 0.10, so the engine and the router disagreed about the only
@@ -353,7 +419,8 @@ def solve(E, wx_block, wx_full, hour, K=None, g=None):
     from .cost import K_DEFAULT
     K = K_DEFAULT if K is None else float(K)
     g = g or grid()
-    hi = HOURS.index(int(hour)) if int(hour) in HOURS else 0
+    slot = TG.as_slot(slot)
+    hi = SLOTS.index(slot) if slot in SLOTS else SLOTS.index(TG.nearest(slot, SLOTS))
     ta = float(wx_block["temperature"])
     rh = float(wx_block["relative_humidity"])
     vp = float(wx_block["vapour_pressure_hpa"])
@@ -361,14 +428,15 @@ def solve(E, wx_block, wx_full, hour, K=None, g=None):
     i_dir = float(wx_block["direct_radiation"])      # horizontal plane
     i_dif = float(wx_block["diffuse_radiation"])
     cloud = float(wx_block["cloud_cover"]) / 100.0
-    _, elev = sun_position(pd.Timestamp(f"{wx_full.get('date','2026-01-26')} {int(hour):02d}:00", tz=TZ))
+    _, elev = sun_position(pd.Timestamp(
+        f"{wx_full.get('date','2026-01-26')} {TG.label(SLOTS[hi])}", tz=TZ))
 
     if "_albg" not in E:                       # per-edge ground albedo, static
         _p = json.load(open(f"{OUT}/material_props.json"))
         E["_albg"] = _props_vec(_p, "albedo", 0.15)[np.clip(E["mat_id"], 0, 255)]
     alb_g = E["_albg"]
 
-    ts_k = E.get("tsurf_k", {}).get(int(hour))          # KELVIN -- see attach_tsurf
+    ts_k = E.get("tsurf_k", {}).get(SLOTS[hi])          # KELVIN -- see attach_tsurf
     tsurf_c = (ts_k - 273.15) if ts_k is not None else np.full(len(E["length"]), ta + 8.0)
 
     svf = np.nan_to_num(E["svf"], nan=0.6)
@@ -377,7 +445,7 @@ def solve(E, wx_block, wx_full, hour, K=None, g=None):
 
     # Facade temperature for MRT's (1-svf)*l_wall term. Falls back to air only if the
     # wall march has not run -- and that fallback IS the old low bias.
-    t_wall_c = E.get("twall_c", {}).get(int(hour))      # CELSIUS -- see _attach_walls
+    t_wall_c = E.get("twall_c", {}).get(SLOTS[hi])      # CELSIUS -- see _attach_walls
     tmrt = MRT.mrt(ta=ta, svf=svf, shade=shade, i_dir_h=i_dir, i_dif=i_dif,
                    elev_deg=elev, tsurf_c=tsurf_c, t_wall_c=t_wall_c,
                    albedo_g=alb_g, rh=rh, cloud=cloud)
@@ -404,6 +472,7 @@ def solve(E, wx_block, wx_full, hour, K=None, g=None):
     uv_frac = np.where(prot, 0.0, uv_frac)      # no beam and no sky under a roof
 
     return {"mrt": tmrt, "utci": u, "stress": s, "mult": mult, "shade": shade,
+            "slot": SLOTS[hi], "time": TG.label(SLOTS[hi]),
             "cost": E["length"] * mult, "clamped": clamped,
             "ta_edge": ta_e, "elev": elev, "uv_frac": uv_frac,
             "uv_index": wx_block.get("uv_index"),
@@ -411,28 +480,27 @@ def solve(E, wx_block, wx_full, hour, K=None, g=None):
 
 
 def wall_temps(wx, t_env_k=None):
-    """{hour: effective facade temperature in degC} for MRT's longwave wall term.
+    """{slot: effective facade temperature in degC} for MRT's longwave wall term.
 
     Closes the "walls radiate at air temperature" bias, which made every MRT low. Marches
     the same balance on a vertical facet for eight orientations and collapses them with
     the QUARTIC mean, the average that preserves emitted flux. Nothing new was added to
     the MRT formula -- (1-svf)*l_wall was always there -- so this cannot double count.
 
-    t_env_k  {hour: K} the ground temperature each facade faces. One-way coupling: hot
+    t_env_k  {slot: K} the ground temperature each facade faces. One-way coupling: hot
              pavement warms the wall, not the reverse. Without it a shaded facade radiates
              to a cold sky over a hemisphere at air temperature and comes out BELOW air,
              when in reality it is looking at 50 C asphalt.
     """
-    hrs = wx["hours"]
-    hrs = {int(k): v for k, v in hrs.items()}
+    rows = _clock(wx)
     date = wx.get("date", "2026-01-26")
-    sun = {h: sun_position(pd.Timestamp(f"{date} {h:02d}:00", tz=TZ)) for h in hrs}
-    W = ST.wall_march(hrs, sun, hours=HOURS, t_env_k=t_env_k)
-    return {h: ST.wall_effective_c(v) for h, v in W.items()}
+    sun = {sl: sun_position(pd.Timestamp(f"{date} {TG.label(sl)}", tz=TZ)) for sl in rows}
+    W = ST.wall_march(rows, sun, hours=SLOTS, t_env_k=t_env_k)
+    return {sl: ST.wall_effective_c(v) for sl, v in W.items()}
 
 
 def _attach_walls(E, wx, mode=None):
-    """Sets E['twall_c'][hour] -> effective facade temperature, degC.
+    """Sets E['twall_c'][slot] -> effective facade temperature, degC.
 
     The ground temperature facades see is the mean over OUTDOOR edges: indoor and covered
     edges carry conditioned or sheltered air, not sunlit pavement.
@@ -445,7 +513,7 @@ def _attach_walls(E, wx, mode=None):
 
 
 def attach_tsurf(E, G, wx, g=None, mode="summer", cache=True):
-    """Sample the hourly Ts rasters onto edges. Sets E['tsurf_k'][hour] -> (n,) float, K.
+    """Sample the Ts rasters onto edges. Sets E['tsurf_k'][slot] -> (n,) float, K.
 
     Once per weather refresh, not per request. Protected edges get the indoor or outdoor
     air temperature instead: there is no sunlit pavement under a shopping centre.
@@ -465,10 +533,11 @@ def attach_tsurf(E, G, wx, g=None, mode="summer", cache=True):
         return E["tsurf_k"]
     ts = surface_temps(wx, g, mode=mode)
     take = _sampler(G, E["edges"], g)
+    rows = _clock(wx)
     E["tsurf_k"] = {}
-    for h in HOURS:
+    for h in SLOTS:
         v = take(ts[h]).astype(np.float64)
-        row = wx["hours"].get(h) or wx["hours"].get(str(h)) or {}
+        row = rows.get(h) or {}
         ta = float(row.get("temperature_2m") or 20.0)
         v = np.where(E["indoor"], INDOOR_TA + 273.15,
                      np.where(E["covered"], ta + 273.15, v))

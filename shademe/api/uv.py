@@ -114,15 +114,20 @@ def attenuate(uv_clear, cloud_pct):
     return max(0.0, float(uv_clear) * (1.0 - CLOUD_A * c ** CLOUD_P))
 
 
-def index_for(hour, now_hour, uv_feed, cloud_pct, elev_deg=None):
-    """(index, source) for one hour. Measurement where there is one, model elsewhere.
+def index_for(when, now, uv_feed, cloud_pct, elev_deg=None):
+    """(index, source) for one slot. Measurement where there is one, model elsewhere.
 
-    ARPANSA publishes the CURRENT value only, so it can answer for the hour being walked
-    and nothing else. Every request this API prices is the current hour, so in practice
+    ARPANSA publishes the CURRENT value only, so it can answer for the time being walked
+    and nothing else. Every request this API prices is the current time, so in practice
     this returns the measurement; the modelled branch covers the clamped early and late
-    hours and is labelled differently so the two can never be confused.
+    slots and is labelled differently so the two can never be confused.
+
+    `when` and `now` are timegrid slots, so "is this the live reading?" is now a 30-minute
+    test rather than a 60-minute one. That is deliberately tighter: at 13:59 the hourly
+    test called a 13:00 measurement current, and UV moves enough across an hour that it
+    was the loosest claim of liveness in the response.
     """
-    if int(hour) == int(now_hour):
+    if int(when) == int(now):
         m, stamp = measured()
         if m is not None:
             return m, f"ARPANSA {ARPANSA_SITE} measured {stamp}"

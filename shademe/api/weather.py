@@ -1,14 +1,31 @@
-"""Open-Meteo hourly weather. No API key. Disk-cached so the demo survives dead wifi.
+"""Open-Meteo weather, hourly plus a 15-minute radiation series. No API key. Disk-cached
+so the demo survives dead wifi.
 
 THIS MODULE SERVES TODAY. There is no summer mode and no winter mode -- a date is the
 only thing any caller ever meant, so a date is what the functions take. `get()` and
 `block()` accept "YYYY-MM-DD", or None for today. Only tools/ wants a fixed day, so that
 benchmarks reproduce; they pass one explicitly or set SHADEME_DATE.
+
+TWO SERIES, AND THEY ARE NOT THE SAME NUMBERS. Open-Meteo also serves `minutely_15`, and
+for THIS cell it splits cleanly in two: temperature_2m at 15 minutes is the exact linear
+interpolation of the hourly endpoints (13.4 -> 13.8, 14.1, 14.4 -> 14.7), so it carries
+no information, while direct/diffuse radiation carry real sub-hourly structure the hourly
+series flattens -- a cloud crossing read 267, 232, 208, 229, 305, 404, 483, 503 W/m2
+inside two hours the hourly series reported as 280 and 210. Radiation is the variable
+this whole product turns on, so it is taken from minutely_15 and nothing else is.
+
+The two series DISAGREE at shared timestamps (11:00 reads 305 in minutely_15 against 210
+hourly): they are different model outputs, not aggregations of each other. So they must
+never be mixed inside one solve. slot_rows() below rebuilds the whole clock off the
+15-minute series, and block() reports from the same rows the engine marched, so the
+radiation quoted in a response is always the radiation that was priced.
 """
 import os, json, time, requests
 
 from . import uv as UV
 from ..paths import DATA
+from .. import timegrid as TG
+from ..timegrid import RAD_STEP_MIN
 
 LAT, LON = -37.8136, 144.9631
 TZ = "Australia/Melbourne"
@@ -40,8 +57,12 @@ VARS = ["temperature_2m", "apparent_temperature", "direct_radiation", "diffuse_r
         "relative_humidity_2m"]   # humidity: needed by MRT longwave + UTCI, added in the v2 engine
 # Open-Meteo defaults wind to km/h; UTCI and the convective term want m/s. Pin the unit
 # explicitly and expose BOTH, so the legacy km/h weight and the physics cannot diverge.
+# Only radiation. See the module docstring: the rest of minutely_15 is interpolation of
+# the hourly series, and asking for it would buy bytes, not information.
+MIN15_VARS = ["direct_radiation", "diffuse_radiation"]
 WIND_UNIT = "kmh"
-CACHE_V = 3                          # bump when VARS changes so old caches are refetched
+CACHE_V = 4                          # bump when VARS changes so old caches are refetched
+                                     # v4: minutely_15 radiation
 TTL = 600                            # re-fetch only if cache older than 10 min
 ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST = "https://api.open-meteo.com/v1/forecast"
@@ -127,6 +148,20 @@ def _by_hour(hourly):
     return out
 
 
+def _by_min15(m15):
+    """minutely_15 arrays -> {minute_of_day: {var: value}} for the first 24 h.
+
+    Keyed in minutes since midnight, the same unit as timegrid, so a slot indexes it
+    directly. 96 rows a day; absent or short is normal (the archive endpoint does not
+    serve it) and slot_rows() falls back to the hourly series when it is.
+    """
+    out = {}
+    for i, t in enumerate((m15 or {}).get("time", [])[:96]):
+        out[int(t[11:13]) * 60 + int(t[14:16])] = {
+            v: ((m15.get(v) or [None] * 96)[i]) for v in MIN15_VARS}
+    return out
+
+
 def _table(tbl, date):
     return {"hours": {h: {v: tbl[v][h] for v in VARS} for h in range(24)}, "date": date}
 
@@ -157,8 +192,11 @@ def _fetch(day):
     endpoint that carries the field is asked first, and the archive covers old dates.
     """
     hourly = ",".join(VARS)
+    # minutely_15 only on the forecast endpoint -- the archive 400s on the parameter, so
+    # asking it there would cost the whole payload, not just the finer radiation.
     f = (FORECAST, dict(latitude=LAT, longitude=LON, start_date=day, end_date=day,
-                        hourly=hourly, timezone=TZ), f"open-meteo forecast {day}")
+                        hourly=hourly, minutely_15=",".join(MIN15_VARS), timezone=TZ),
+         f"open-meteo forecast {day}")
     a = (ARCHIVE, dict(latitude=LAT, longitude=LON, start_date=day, end_date=day,
                        hourly=hourly, timezone=TZ), f"open-meteo archive {day}")
     # The forecast endpoint serves ~92 days back and 400s on older dates, so ask the
@@ -170,7 +208,8 @@ def _fetch(day):
             j = _get(url, params)
             hrs = _by_hour(j["hourly"])
             if hrs and any(hrs[h].get("direct_radiation") is not None for h in hrs):
-                return {"hours": hrs, "date": day}, label
+                m15 = _by_min15(j.get("minutely_15"))
+                return {"hours": hrs, "min15": m15, "date": day}, label
         except Exception as e:
             err = e
             print(f"[weather] {label} failed: {e}")
@@ -202,6 +241,7 @@ def get(day=None):
         try:
             c = json.load(open(_cache_path(day)))
             c["hours"] = {int(k): v for k, v in c["hours"].items()}
+            c["min15"] = {int(k): v for k, v in (c.get("min15") or {}).items()}
             _mem[day] = c
         except Exception:
             c = None
@@ -339,7 +379,110 @@ def apply_bias(p):
     return q
 
 
-def solar_elevation(day, hour):
+# --- the half-hour clock the engine marches ------------------------------------
+
+def _interp_hourly(hours, minute, var):
+    """Linearly interpolate one hourly variable to a minute-of-day, wrapping midnight.
+
+    NOT an invention: Open-Meteo's own minutely_15 temperature_2m is exactly this
+    interpolation of its hourly endpoints, so a half-hour Ta is the number the provider
+    would have served anyway. Radiation does NOT come through here -- see slot_rows.
+
+    Caveat, stated because the field exists: precipitation is an hourly ACCUMULATION, so
+    interpolating it gives a rate-like number, not a half-hour total. Only the legacy
+    w_wet weight reads it and that is off by default; do not start using it as a total.
+    """
+    h0 = int(minute) // 60 % 24
+    h1 = (h0 + 1) % 24
+    a, b = (hours.get(h0) or {}).get(var), (hours.get(h1) or {}).get(var)
+    if a is None:
+        return b
+    if b is None:
+        return a
+    f = (int(minute) % 60) / 60.0
+    return float(a) + (float(b) - float(a)) * f
+
+
+def _rad_over(m15, slot, step):
+    """Mean direct/diffuse over [slot, slot+step) from the 15-minute series, or None.
+
+    A MEAN over the slot, not the instantaneous value at its start: the slot is an
+    interval the walker spends time in, and the march holds one forcing constant across
+    it. Returns None when the series does not cover the interval, which is the signal to
+    fall back to the hourly numbers.
+    """
+    keys = [k for k in range(int(slot), int(slot) + int(step), RAD_STEP_MIN) if k in m15]
+    if not keys:
+        return None
+    out = {}
+    for v in MIN15_VARS:
+        vals = [m15[k][v] for k in keys if m15[k].get(v) is not None]
+        if not vals:
+            return None
+        out[v] = float(sum(vals)) / len(vals)
+    return out
+
+
+def slot_rows(p, step=None):
+    """{slot: row} over the WHOLE 24 h clock at timegrid's step, cached on the payload.
+
+    This is what physics.surface_temp.march() clocks on and what solve() prices from, so
+    it is the one place the two series are joined. Radiation comes from minutely_15 where
+    it reaches, everything else is interpolated from the hourly rows. `rad_source` on each
+    row records which, because a slot silently served hourly radiation and one served
+    15-minute radiation are not the same measurement and the response says which it was.
+
+    Pass a payload that has already been through apply_bias(): the correction is a
+    temperature one and belongs on the hourly rows it was fitted against, so interpolating
+    a corrected Ta is right and correcting an interpolated one would refit nothing.
+    """
+    step = TG.STEP_MIN if step is None else int(step)
+    ck = f"_slots_{step}"
+    if p.get(ck):
+        return p[ck]
+    hours = {int(k): v for k, v in (p.get("hours") or {}).items()}
+    m15 = {int(k): v for k, v in (p.get("min15") or {}).items()}
+    out = {}
+    for slot in range(0, 24 * 60, step):
+        row = {v: _interp_hourly(hours, slot, v) for v in VARS}
+        rad = _rad_over(m15, slot, step)
+        if rad:
+            row.update(rad)
+        row["rad_source"] = "minutely_15" if rad else "hourly (interpolated)"
+        out[slot] = row
+    p[ck] = out
+    return out
+
+
+def rad_source(p):
+    """One label for how the day's radiation was resolved, for the provenance stamp."""
+    rows = slot_rows(p)
+    n = sum(1 for r in rows.values() if r["rad_source"] == "minutely_15")
+    if n == len(rows):
+        return "minutely_15"
+    if n == 0:
+        return "hourly (interpolated -- no minutely_15)"
+    return f"minutely_15 on {n}/{len(rows)} slots, hourly elsewhere"
+
+
+def _slot_offset(p, slot):
+    """The fitted Ta offset at a slot, interpolated between the two bracketing hours.
+
+    The table is a smooth zero-mean diurnal SHAPE fitted per season, so interpolating it
+    is reading it at the resolution it was always meant to describe. Stepping it on the
+    hour would put a discontinuity in Ta at every :30 that nothing physical produces.
+    """
+    offs = {int(k): float(v) for k, v in ((p.get("bias") or {}).get("offsets") or {}).items()}
+    if not offs:
+        return 0.0
+    h0, h1 = int(slot) // 60 % 24, (int(slot) // 60 + 1) % 24
+    a, b = offs.get(h0), offs.get(h1)
+    if a is None or b is None:
+        return float(a if a is not None else (b or 0.0))
+    return a + (b - a) * ((int(slot) % 60) / 60.0)
+
+
+def solar_elevation(day, when):
     """Solar elevation in degrees, or None if the astronomy helper is not importable.
 
     Only the archive path needs it (uv.clear_sky), so an ImportError must degrade to "no
@@ -348,26 +491,38 @@ def solar_elevation(day, hour):
     try:
         import pandas as pd
         from ..physics.shadow import sun_position
-        return float(sun_position(pd.Timestamp(f"{day} {int(hour):02d}:00", tz=TZ))[1])
+        slot = TG.as_slot(when)
+        return float(sun_position(pd.Timestamp(f"{day} {TG.label(slot)}", tz=TZ))[1])
     except Exception:
         return None
 
 
-def block(hour, day=None, now_hour=None, wet=False):
-    """The weather block for one hour of one day.
+def block(when, day=None, now_min=None, wet=False, beam=True):
+    """The weather block for one SLOT of one day. `when` is a slot, an hour, or 'HH:MM'.
 
-    `now_hour` is the wall-clock hour, and it is what lets the UV index be a MEASUREMENT
-    rather than a model: the live ARPANSA reading can only answer for right now. None
-    means "do not claim anything is live" and gives the modelled branch throughout.
+    Read off slot_rows(), not off the hourly rows, so the radiation reported here is the
+    radiation the engine marched -- see the module docstring on the two series.
+
+    `now_min` is the wall-clock minute-of-day, and it is what lets the UV index be a
+    MEASUREMENT rather than a model: the live ARPANSA reading can only answer for right
+    now. None means "do not claim anything is live" and gives the modelled branch.
+
+    `beam=False` zeroes direct and diffuse radiation and the UV index. That is for times
+    OUTSIDE the daylight window, where the sun is below the horizon at this latitude on
+    every day of the year (timegrid explains the window) and the alternative -- serving
+    the last daylight slot's numbers -- prices a 21:30 walk on a beam that set at 20:44.
 
     `wet` restores the legacy precipitation/wind weight, which only the old `edge_cost`
     path reads. The physical engine uses neither w_heat nor w_wet.
     """
     p = apply_bias(get(day))
-    hrs = p["hours"]
-    h = int(hour) if int(hour) in hrs else min(hrs, key=lambda k: abs(k - int(hour)))
-    r = hrs[h]
+    rows = slot_rows(p)
+    slot = TG.as_slot(when)
+    h = slot if slot in rows else TG.nearest(slot, rows)
+    r = rows[h]
     direct, diffuse = _f(r["direct_radiation"]), _f(r["diffuse_radiation"])
+    if not beam:
+        direct = diffuse = 0.0                 # sun is down -- see the docstring
     tot = direct + diffuse
     direct_fraction = (direct / tot) if tot > 0 else 0.0
     app = _f(r["apparent_temperature"])
@@ -377,12 +532,14 @@ def block(hour, day=None, now_hour=None, wet=False):
     rh_raw = r.get("relative_humidity_2m")
     rh = 50.0 if rh_raw is None else float(rh_raw)
 
-    raw = (p.get("hours_raw") or {}).get(h, r)
-    temp_raw, app_raw, rh_uncorr = (_f(raw.get("temperature_2m")),
-                                    _f(raw.get("apparent_temperature")),
-                                    50.0 if raw.get("relative_humidity_2m") is None
-                                    else float(raw["relative_humidity_2m"]))
-    off = float((p.get("bias") or {}).get("offsets", {}).get(h, 0.0))
+    # The uncorrected comparison, interpolated to the same slot so the pair is like for
+    # like: quoting a corrected 13:30 against a raw 13:00 would read as bias.
+    raw_hours = {int(k): v for k, v in (p.get("hours_raw") or p.get("hours") or {}).items()}
+    temp_raw = _f(_interp_hourly(raw_hours, h, "temperature_2m"))
+    app_raw = _f(_interp_hourly(raw_hours, h, "apparent_temperature"))
+    _rh_raw = _interp_hourly(raw_hours, h, "relative_humidity_2m")
+    rh_uncorr = 50.0 if _rh_raw is None else float(_rh_raw)
+    off = _slot_offset(p, h)
     bias_mode = (p.get("bias") or {}).get("mode", "off")
     vp = vapour_pressure(temp, rh)
     wind_ms = wind / 3.6                       # WIND_UNIT is pinned to km/h upstream
@@ -394,14 +551,19 @@ def block(hour, day=None, now_hour=None, wet=False):
     if uv_feed is None:
         uv_feed = r.get("uv_index_clear_sky")
     cloud = _f(r.get("cloud_cover"))
-    uv, uv_source = UV.index_for(h, now_hour if now_hour is not None else -1,
+    uv, uv_source = UV.index_for(h, now_min if now_min is not None else -1,
                                  None if uv_feed is None else float(uv_feed), cloud,
                                  elev_deg=solar_elevation(p.get("date"), h))
+    if not beam:
+        uv, uv_source = 0.0, "sun below the horizon"
     if not wet:
         w_wet = 0.0                              # legacy weight; off unless asked for
     return {
         "date": p.get("date"),
-        "hour": h,
+        "slot": h,
+        "time": TG.label(h),
+        "hour": TG.hour_of(h),                           # legacy field, whole hours only
+        "rad_source": r.get("rad_source", "hourly"),
         "temperature": round(temp, 1),
         "apparent_temperature": round(app, 1),
         "direct_radiation": round(direct, 1),
@@ -424,5 +586,5 @@ def block(hour, day=None, now_hour=None, wet=False):
         "direct_fraction": round(direct_fraction, 3),
         "w_heat": round(w_heat, 3),
         "w_wet": round(w_wet, 3),
-        "source": f"{p['source']} | {p['date']} {h:02d}:00 {TZ}",
+        "source": f"{p['source']} | {p['date']} {TG.label(h)} {TZ} | rad {r.get('rad_source')}",
     }

@@ -6,10 +6,20 @@ export type Objective = 'thermal' | 'uv';
 
 export interface Conditions {
   as_of: string;
+  /** Minutes since local midnight, on the half-hour grid the engine prices. */
+  slot: number;
+  /** `slot` as HH:MM. Prefer this over `hour` for anything shown to a person. */
+  time: string;
+  /** Legacy whole-hour form of `slot`, kept so older clients keep parsing. */
   hour: number;
   /** True when the wall clock fell outside 06:00-20:00 and was pulled into it. */
   clamped: boolean;
-  /** The day actually priced. Today unless SHADEME_SUMMER_DATE pins it. */
+  /** False when the sun is below the horizon: the beam was ZEROED, not carried over
+   * from the nearest daylight slot, so there is no shade worth detouring for. */
+  beam: boolean;
+  /** Where the radiation came from: the 15-minute series, or interpolated hourly. */
+  rad_source: string;
+  /** The day actually priced. Today unless SHADEME_DATE pins it. */
   date: string;
   is_today: boolean;
   temperature: number;
@@ -113,7 +123,15 @@ export interface RouteOption {
 
 export interface RoutesMeta {
   snap_m: [number, number];
+  /** Minutes since local midnight; `time` is its HH:MM form and `hour` the legacy one. */
+  slot: number;
+  time: string;
   hour: number;
+  clamped: boolean;
+  beam: boolean;
+  rad_source: string;
+  /** Spacing of the shade/Ts grid this was priced on, in minutes. */
+  step_min: number;
   as_of: string;
   k_ladder: number[];
   k_uv_ladder: number[];

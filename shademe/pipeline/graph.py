@@ -10,6 +10,7 @@ from pyproj import Transformer
 import networkx as nx
 
 from ..config import CELL, WGS84, MGA55
+from .. import timegrid as TG
 from ..paths import DATA, OUT
 
 _tf = Transformer.from_crs(WGS84, MGA55, always_xy=True)
@@ -270,6 +271,10 @@ def deck_shade(G, deck, grid, day, hours=HOURS, n=N_SAMPLE, canopy=None):
     numbers in a different container -- it re-samples per day at request time and never
     touches the pickled `shade` dict. One implementation, two callers.
 
+    `hours` is read through timegrid.as_slot, so both callers work: build() passes whole
+    hours for the pickled legacy dict, the engine passes half-hour slots. An int below 24
+    is an hour, anything larger is minutes since midnight.
+
     `day` must be the day the rasters being overwritten were generated for, and `canopy`
     likewise: build() bakes the LEGACY ground set into the pickle while the engine
     re-samples out/v2 at runtime, so the two callers pass different pairs on purpose.
@@ -287,7 +292,8 @@ def deck_shade(G, deck, grid, day, hours=HOURS, n=N_SAMPLE, canopy=None):
     fr, fc, fz = rows.ravel(), cols.ravel(), z.ravel()
     out = np.zeros((len(hours), len(deck)), dtype=np.float32)
     for i, h in enumerate(hours):
-        az, el = sun_position(pd.Timestamp(f"{day} {h:02d}:00", tz="Australia/Melbourne"))
+        when = f"{day} {TG.label(TG.as_slot(h))}"
+        az, el = sun_position(pd.Timestamp(when, tz="Australia/Melbourne"))
         v = point_shade(dsm_b, dsm_c, dsm_cb, grid["cell"], az, el, fr, fc, fz,
                         tau_leaf=TAU_LEAF)
         out[i] = (v.reshape(rows.shape) * inside).sum(1) / cnt

@@ -34,11 +34,17 @@ from . import osm_hours
 from .cost import (summarise, segments, thermal_summary, compare_thermal,
                    uv_summary, compare_uv)
 from ..paths import OUT
+from .. import timegrid as TG
 
-# The shade rasters cover 06:00-20:00. Outside it we clamp and say so in `meta.clamped`
-# rather than quietly pricing 23:00 on the 20:00 sun. The day priced is today unless
-# SHADEME_DATE pins it; the shade set follows that date, so the first request on a new
-# day regenerates it (~13 s) rather than costing today's walk on yesterday's shadows.
+# The shade rasters cover 06:00-20:00 in half-hour slots -- timegrid owns the grid and
+# says why it is exactly that window. Outside it the sun is below the horizon on every
+# day of the year here, so we clamp to the nearest edge of the window AND zero the beam:
+# serving 21:30 off the 20:00 slot would price a walk on a beam that set at 20:44 and
+# make the router prefer shade for a sun that is not there. `meta.clamped` and
+# `meta.beam` report both halves of that.
+#
+# The day priced is today unless SHADEME_DATE pins it; the shade set follows that date,
+# and the prewarm thread -- not the first request -- pays for generating it.
 FIRST_HOUR, LAST_HOUR = 6, 20
 FALLBACK_HOUR = 16          # only for the graph-rebuild path, never for pricing
 
@@ -217,7 +223,7 @@ def _startup():
     print(f"[shademe] graph {G.number_of_nodes()} nodes / {G.number_of_edges()} edges "
           f"from {src} in {time.time() - t0:.1f}s")
     try:
-        print(f"[shademe] weather: {weather.block(now_hour())['source']}")
+        print(f"[shademe] weather: {weather.block(now_slot()[0])['source']}")
     except Exception as e:
         print(f"[shademe] weather prewarm failed: {e}")
     # NO PROVENANCE STAMP HERE. It cannot be known until a request fixes the day, and
@@ -242,8 +248,8 @@ def warm_once():
     t0 = time.time()
     WARM.update(state="building", error=None)
     from . import engine as _e
-    h = now_hour()
-    w = weather.block(h, now_hour=now_local().hour)
+    h, _clamped, lit = now_slot()
+    w = weather.block(h, now_min=TG.of(now_local()), beam=lit)
     st = engine_state()
     with APPLY_LOCK:
         if h not in st["solved"]:
@@ -280,7 +286,7 @@ def prewarm():
         try:
             dt = warm_once()
             if dt > 2.0:                      # a real rebuild, not a cache hit
-                print(f"[shademe] engine warm for hour {now_hour():02d} in {dt:.1f}s")
+                print(f"[shademe] engine warm for {TG.label(now_slot()[0])} in {dt:.1f}s")
         except Exception as e:
             # A failed warm is not a failed server: the request path still builds its own
             # state, and raises there, where the client can see why.
@@ -309,7 +315,23 @@ def now_local():
 
 
 def now_hour():
+    """The wall-clock HOUR, clamped. Only for hourly tables -- opening hours, the graph
+    rebuild fallback. Everything priced goes through now_slot()."""
     return max(FIRST_HOUR, min(LAST_HOUR, now_local().hour))
+
+
+def now_slot():
+    """(slot, clamped, in_window) for right now, on timegrid's half-hour grid.
+
+    Snapped to the NEAREST slot, not floored: at 13:52 the walk about to happen is much
+    closer to 14:00's sun than to 13:30's, and flooring would hold a route on shadows up
+    to 29 minutes stale where rounding caps it at 15.
+
+    `in_window` false means the sun is down; the caller must then price with the beam
+    zeroed rather than borrowing the clamped slot's radiation.
+    """
+    raw = TG.snap(TG.of(now_local()))
+    return TG.clamp(raw), TG.clamp(raw) != raw, TG.in_window(raw)
 
 
 def condition_code(w):
@@ -337,15 +359,22 @@ def condition_code(w):
 
 def conditions_block():
     t = now_local()
-    h = now_hour()
-    # now_hour() is passed separately from the hour being priced: they differ only when
-    # the wall clock falls outside 06-20, and the live UV measurement is only allowed to
-    # answer for the real current hour. See uv.py.
-    w = weather.block(h, now_hour=t.hour)
+    h, clamped, lit = now_slot()
+    # The real minute-of-day is passed separately from the slot being priced: they differ
+    # only when the wall clock falls outside the window, and the live UV measurement is
+    # only allowed to answer for right now. See uv.py.
+    w = weather.block(h, now_min=TG.of(t), beam=lit)
     return {
         "as_of": t.isoformat(),
-        "hour": h,
-        "clamped": h != t.hour,
+        "slot": h,
+        "time": TG.label(h),
+        "hour": TG.hour_of(h),                  # legacy field, kept for older clients
+        "clamped": clamped,
+        # False means the sun is below the horizon and the beam was zeroed rather than
+        # borrowed from the nearest daylight slot. Not decoration: it is the difference
+        # between "no shade to route around" and "shade worth a detour".
+        "beam": lit,
+        "rad_source": w.get("rad_source"),
         "date": w["date"],
         "is_today": w["date"] == str(t.date()),
         "temperature": w["temperature"],
@@ -454,7 +483,7 @@ def _provenance_for(shade_key):
 
 
 def solve_apply(st, h, w):
-    """Stash per-edge UTCI and stress on the graph for hour `h`. Cached per hour.
+    """Stash per-edge UTCI and stress on the graph for slot `h`. Cached per slot.
 
     CALLERS MUST HOLD APPLY_LOCK, and must hold it until they have finished reading the
     graph. apply() writes the `_`-prefixed fields onto the shared graph and A* reads them
@@ -475,7 +504,7 @@ def solve_apply(st, h, w):
 # --- routes ---------------------------------------------------------------------
 
 def describe(G, path, h, w):
-    """Everything one option needs, under the hour and weather already applied."""
+    """Everything one option needs, under the slot and weather already applied."""
     out = summarise(G, path, h, w["direct_radiation"])
     out.update(thermal_summary(G, path))
     out.update(uv_summary(G, path, w.get("uv_index")))
@@ -562,7 +591,8 @@ def health():
         raise HTTPException(503, "graph not loaded")
     return {"ok": True, "nodes": G.number_of_nodes(), "edges": G.number_of_edges(),
             "graph_source": S["source"],
-            "hour": now_hour(), "date": weather.resolve_day(),
+            "hour": now_hour(), "slot": now_slot()[0],
+            "time": TG.label(now_slot()[0]), "date": weather.resolve_day(),
             # cold / building / ready / failed. A route asked for while this says
             # "building" is correct but slow -- it waits for the march to finish.
             "engine": WARM["state"], "engine_ms": WARM["ms"],
@@ -702,14 +732,17 @@ def get_conditions():
 @app.get("/routes")
 def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
                respect_hours: bool = Query(True)):
-    """Distinct walking options between two points, priced at the current hour."""
+    """Distinct walking options between two points, priced at the current half hour."""
     t0 = time.time()
     G = S["G"]
     cond, w, h = conditions_block()
     dw = hours.now_dow()
     # Opening hours are a hard gate, not a cost: a shut arcade is an absent edge. Applied
     # identically to every option so the comparison between them stays attributable.
-    closed = hours.closed_keys(h, dw) if respect_hours else set()
+    # Opening hours are a WALL-CLOCK table in whole hours, so they take now_hour() and
+    # not the priced slot: an arcade that shuts at 18:00 is shut at 18:00 whatever the sun
+    # is doing, and clamping the routing slot must not reopen it.
+    closed = hours.closed_keys(now_hour(), dw) if respect_hours else set()
 
     # THE SAME `closed` THE ROUTER USES. Snapping on the ungated graph is what stranded
     # a start or end inside a shut arcade and produced "no walkable path".
@@ -736,7 +769,7 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
     with APPLY_LOCK:
         solve_apply(st, h, w)
 
-        # Walk both ladders. solve() is cached per hour, so each extra search is one more A*
+        # Walk both ladders. solve() is cached per slot, so each extra search is one more A*
         # over a warm graph -- a few ms, not a few seconds.
         seen, opts, baseline = {}, [], None
         searches = ([("thermal", K, routing.route_utci) for K in K_LADDER]
@@ -841,7 +874,13 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
         "options": opts,
         "meta": {
             "snap_m": [round(ds, 1), round(dt, 1)],
-            "hour": h,
+            "slot": h,
+            "time": TG.label(h),
+            "hour": TG.hour_of(h),              # legacy field, kept for older clients
+            "clamped": cond["clamped"],
+            "beam": cond["beam"],
+            "rad_source": cond.get("rad_source"),
+            "step_min": TG.STEP_MIN,
             "as_of": cond["as_of"],
             "k_ladder": list(K_LADDER),
             "k_uv_ladder": list(K_UV_LADDER),
@@ -850,7 +889,7 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
             "dominated_dropped": dominated,
             "near_duplicates_merged": near,
             "unlabelled_dropped": unlabelled,
-            "availability": dict(hours.describe(h, dw), enforced=respect_hours),
+            "availability": dict(hours.describe(now_hour(), dw), enforced=respect_hours),
             "detour_cap": routing.DETOUR_CAP,
             # WHICH GROUND THIS WAS PRICED ON. `conditions` above is always live -- the
             # air temperature, radiation and wind in the cost are this request's. What can

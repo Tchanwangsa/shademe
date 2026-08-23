@@ -12,11 +12,11 @@ it at all — that is the difference here.
 
 ## What it actually computes
 
-For the hour being walked, per edge of a 61k-edge pedestrian graph:
+For the half hour being walked, per edge of a 61k-edge pedestrian graph:
 
 ```
 shade raster + sky view factor + surface material
-        -> surface energy balance          (Ts, marched hourly)
+        -> surface energy balance          (Ts, marched at 30 min)
         -> mean radiant temperature        (SOLWEIG six-direction form)
         -> UTCI                            (Brode et al. 2012 polynomial)
         -> thermal stress = degrees outside the 9..26 degC no-stress band
@@ -45,7 +45,9 @@ at the same hour, and the percentage reads worst exactly when the city is hottes
 | 17   | 160.4             | 29.7             | 18.5      |
 
 Late sun is low, the whole city is in shadow, and the shortest path is already shaded, so
-proportionally less is left to win. Reproduce with `tools/bench_hours.py`.
+proportionally less is left to win. Reproduce with `tools/bench_hours.py`. Measured on the
+hourly grid, before the move to half-hour slots — the shape holds, but re-run it before
+quoting the digits against a current build.
 
 ---
 
@@ -174,10 +176,23 @@ Nominatim, per its usage policy), caches for 15 minutes, and sends an identifyin
 User-Agent; the client debounces 300 ms so a search fires per word typed rather than per
 keystroke. Anything past demo traffic should self-host.
 
-The first `/routes` call of the day pays for the surface energy-balance march (~40 s) and
-regenerates the shade set if none matches today's sun (~13 s). Every call after that is
-about 100 ms. There is no `hour` parameter, by design: everything is priced at the wall
-clock in Australia/Melbourne, clamped to the 06:00–20:00 window the rasters cover.
+The background prewarm thread — not the first caller — pays for the surface
+energy-balance march (~40 s) and for generating the shade set when none matches today's
+sun (~27 s for 29 rasters). Calls are about 100 ms.
+
+There is no `hour` parameter, by design: everything is priced at the wall clock in
+Australia/Melbourne, snapped to the **nearest half hour** and clamped to the 06:00–20:00
+window. That window is not a guess — over all 8760 hours of 2026 the sun's apparent
+elevation never exceeds −9.20° at 05:00 or −3.26° at 21:00 here, and `tests/test_timegrid.py`
+re-derives it from pvlib rather than trusting the constant. Outside it the response
+carries `meta.beam: false` and the beam is **zeroed**, not borrowed from 20:00 — pricing a
+21:30 walk on a sun that set at 20:44 made the router prefer shade in the dark.
+
+Radiation comes from Open-Meteo's 15-minute series where it reaches (`meta.rad_source`),
+because that is the one variable whose sub-hourly structure is real: a cloud crossing
+reads 267 → 208 → 503 W/m² inside two hours the hourly series flattens to 280 and 210.
+Temperature is not taken from it — at 15 minutes Open-Meteo simply interpolates its own
+hourly endpoints, so there is nothing there to take.
 
 Bind to `0.0.0.0` for a physical phone — `localhost` resolves to the phone itself.
 
