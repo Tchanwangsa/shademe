@@ -78,8 +78,28 @@ uv sync
 uv run uvicorn shademe.api.main:app --host 0.0.0.0 --port 8011
 ```
 
-`GET /health` `/places` `/conditions` `/routes?from_lat=&from_lon=&to_lat=&to_lon=`,
-plus OpenAPI at `/docs`.
+`GET /health` `/places` `/conditions` `/routes?from_lat=&from_lon=&to_lat=&to_lon=`
+`/search?q=` `/reverse?lat=&lon=`, plus OpenAPI at `/docs`.
+
+### Place search
+
+`/search` geocodes free text against OpenStreetMap, so the picker is not limited to the
+fifteen landmarks `/places` still returns for an empty box. Two providers, one dataset:
+**Photon** answers first because it matches prefixes — `degrav` already finds Degraves
+Street — and **Nominatim** is the fallback and owns `/reverse`, because it matches whole
+words only (`degrav` and `flind` return nothing there) but is the better geocoder on a
+finished query. `SHADEME_GEOCODER=nominatim` pins one; `SHADEME_PHOTON` and
+`SHADEME_NOMINATIM` point at self-hosted instances.
+
+Every match is snapped to the walking graph and dropped beyond 300 m — **the same reach
+`/routes` allows**, so search cannot offer a destination routing will then refuse.
+Matches dropped for that are counted in `outside` rather than silently discarded, which
+is how the client can say "outside the CBD" instead of "no such place".
+
+Both providers are rate-limited free services. `geocode.py` throttles per host (1 rps for
+Nominatim, per its usage policy), caches for 15 minutes, and sends an identifying
+User-Agent; the client debounces 300 ms so a search fires per word typed rather than per
+keystroke. Anything past demo traffic should self-host.
 
 The first `/routes` call of the day pays for the surface energy-balance march (~40 s) and
 regenerates the shade set if none matches today's sun (~13 s). Every call after that is

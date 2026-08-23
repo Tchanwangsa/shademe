@@ -48,16 +48,21 @@ function EndpointRow({
   return (
     <Pressable onPress={onPress} className="flex-row items-center gap-2.5 py-2">
       <Ionicons name={icon as any} size={17} color={color} />
-      <Text
-        className={
-          place
-            ? 'flex-1 text-[15px] text-ink dark:text-paper'
-            : 'flex-1 text-[15px] text-ink-soft'
-        }
-        numberOfLines={1}
-      >
-        {place?.name ?? placeholder}
-      </Text>
+      <View className="flex-1">
+        <Text
+          className={place ? 'text-[15px] text-ink dark:text-paper' : 'text-[15px] text-ink-soft'}
+          numberOfLines={1}
+        >
+          {place?.name ?? placeholder}
+        </Text>
+        {/* OSM has six 7-Elevens in the CBD, all called 7-Eleven. Without the street
+            the row cannot say which one was picked. */}
+        {place?.address ? (
+          <Text className="text-[12px] text-ink-soft" numberOfLines={1}>
+            {place.address}
+          </Text>
+        ) : null}
+      </View>
     </Pressable>
   );
 }
@@ -86,6 +91,8 @@ function ShadeMe() {
   const sheetHeight =
     windowHeight * Math.min(DETENTS[detent] ?? DETENTS[1], MAX_SHEET_FRACTION);
 
+  // The curated landmarks. Only a fallback now that the picker searches OpenStreetMap:
+  // it is what fills the list before the first search response lands.
   useEffect(() => {
     const ac = new AbortController();
     api.places(ac.signal).then(setPlaces).catch((e: ApiError) => setError(e.message));
@@ -134,11 +141,27 @@ function ShadeMe() {
     setPicking(null);
     const { status } = await Location.requestForegroundPermissionsAsync();
     if (status !== 'granted') {
-      setError('Location permission denied — pick a starting point from the list instead.');
+      setError('Location permission denied — search for a starting point instead.');
       return;
     }
     const pos = await Location.getCurrentPositionAsync({});
-    setFrom({ name: 'My location', lat: pos.coords.latitude, lon: pos.coords.longitude });
+    const { latitude: lat, longitude: lon } = pos.coords;
+    // Name the fix from OpenStreetMap, but keep the user's own coordinates: routing from
+    // the centroid of whatever building the fix landed in would move them without saying
+    // so. A failed lookup is not a failed fix -- fall back to the plain label and let
+    // /routes be the one to complain if the spot is unreachable.
+    try {
+      const here = await api.reverse(lat, lon);
+      setFrom(here);
+      if (!here.in_coverage) {
+        setError(
+          'You are outside the area ShadeMe covers — it only knows the Melbourne CBD. ' +
+            'Search for a starting point inside it instead.',
+        );
+      }
+    } catch {
+      setFrom({ name: 'My location', lat, lon });
+    }
   }, []);
 
   const options = routes?.options ?? [];

@@ -89,3 +89,68 @@ export function exposureSlices(option: RouteOption): ExposureSlice[] {
   }
   return out;
 }
+
+/** Ionicons name for OSM's word for a place.
+ *
+ * OSM has thousands of tag values and this maps a couple of dozen, which is deliberate:
+ * the glyph is here to separate a street from a station from a shop at a glance, not to
+ * classify. Everything unmapped falls through to a pin, which is never wrong.
+ */
+const PLACE_ICONS: Record<string, string> = {
+  // The curated list and the GPS fix, which are ours rather than OSM's.
+  landmark: 'star-outline',
+  here: 'locate',
+  // Ways you walk on. OSM names these by road class, so the list is long and dull.
+  pedestrian: 'walk-outline',
+  footway: 'walk-outline',
+  path: 'walk-outline',
+  steps: 'walk-outline',
+  living_street: 'walk-outline',
+  service: 'git-branch-outline',
+  residential: 'git-branch-outline',
+  tertiary: 'git-branch-outline',
+  secondary: 'git-branch-outline',
+  primary: 'git-branch-outline',
+  trunk: 'git-branch-outline',
+  street: 'git-branch-outline',
+  road: 'git-branch-outline',
+  highway: 'git-branch-outline',
+  // Transport, which is most of what people actually route to.
+  station: 'train-outline',
+  halt: 'train-outline',
+  subway_entrance: 'enter-outline',
+  tram_stop: 'train-outline',
+  stop: 'bus-outline',
+  bus_stop: 'bus-outline',
+  platform: 'train-outline',
+  // Somewhere to be.
+  cafe: 'cafe-outline',
+  restaurant: 'restaurant-outline',
+  fast_food: 'fast-food-outline',
+  bar: 'beer-outline',
+  pub: 'beer-outline',
+  marketplace: 'basket-outline',
+  mall: 'bag-handle-outline',
+  supermarket: 'basket-outline',
+  convenience: 'basket-outline',
+  shop: 'bag-handle-outline',
+  park: 'leaf-outline',
+  garden: 'leaf-outline',
+  library: 'library-outline',
+  museum: 'business-outline',
+  university: 'school-outline',
+  college: 'school-outline',
+  school: 'school-outline',
+  hospital: 'medkit-outline',
+  clinic: 'medkit-outline',
+  pharmacy: 'medkit-outline',
+  hotel: 'bed-outline',
+  place_of_worship: 'business-outline',
+  building: 'business-outline',
+  office: 'business-outline',
+  house: 'home-outline',
+  apartments: 'business-outline',
+};
+
+export const placeIcon = (kind?: string | null) =>
+  (kind && PLACE_ICONS[kind]) || 'location-outline';

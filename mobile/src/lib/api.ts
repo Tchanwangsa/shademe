@@ -138,6 +138,29 @@ export interface Place {
   name: string;
   lat: number;
   lon: number;
+  /** The muted second line -- street, suburb. Null on the curated list, where the name
+   * is already the whole answer. */
+  address?: string | null;
+  /** OSM's own word for the thing: pedestrian, marketplace, station, cafe. Drives the
+   * glyph in the picker. "landmark" for the curated list, "here" for a GPS fix. */
+  kind?: string | null;
+  /** How far the nearest walkable node is. The engine routes from there, not from the
+   * pin, and for a big place like a station the two differ by a block. */
+  snap_m?: number | null;
+}
+
+export interface SearchResponse {
+  query: string;
+  results: Place[];
+  /** Matches that fit the words but landed outside the CBD the graph covers. The
+   * difference between "no such place" and "not one we can walk you to". */
+  outside: number;
+  source: 'curated' | 'photon' | 'nominatim' | 'none';
+}
+
+/** A GPS fix, named. `lat`/`lon` come back exactly as sent -- only the label is OSM's. */
+export interface ReverseResponse extends Place {
+  in_coverage: boolean;
 }
 
 export class ApiError extends Error {
@@ -170,6 +193,12 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
 
 export const api = {
   places: (signal?: AbortSignal) => get<Place[]>('/places', signal),
+  /** Free-text place search over OpenStreetMap, already filtered to what the engine can
+   * route. A query under two characters comes back as the curated list. */
+  search: (q: string, signal?: AbortSignal) =>
+    get<SearchResponse>(`/search?q=${encodeURIComponent(q)}`, signal),
+  reverse: (lat: number, lon: number, signal?: AbortSignal) =>
+    get<ReverseResponse>(`/reverse?lat=${lat}&lon=${lon}`, signal),
   conditions: (signal?: AbortSignal) => get<Conditions>('/conditions', signal),
   routes: (from: Place, to: Place, signal?: AbortSignal) =>
     get<RoutesResponse>(

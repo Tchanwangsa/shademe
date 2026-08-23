@@ -11,6 +11,9 @@ the mobile client talks to. It makes three commitments:
     both. Two searches producing the same walk collapse to one option, which is the
     honest answer when there is no better way to go.
   * NO FIGURE WITHOUT ITS CONFIG. `meta.provenance` rides on every response.
+  * ONLY REACHABLE PLACES ARE OFFERED. `/search` geocodes free text against
+    OpenStreetMap and then drops every match the walking graph cannot reach, so the
+    picker cannot hand `/routes` a destination it will refuse.
 """
 import os, time, pickle
 from contextlib import asynccontextmanager
@@ -22,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from . import weather
 from . import routing
 from . import hours
+from . import geocode
 from .cost import (summarise, segments, thermal_summary, compare_thermal,
                    uv_summary, compare_uv)
 from ..paths import OUT
@@ -55,6 +59,13 @@ SAME_WALK_UV = 2.0
 CORS_ORIGINS = [o.strip() for o in os.environ.get("SHADEME_CORS_ORIGINS", "*").split(",")
                 if o.strip()]
 
+# How far a searched place may sit from the nearest walkable node. THE SAME REACH
+# `/routes` allows, and that is the whole point: the picker's filter and the router's
+# gate have to be one number, or search offers destinations routing then rejects.
+SEARCH_SNAP_M = 300.0
+
+# Suggestions, not the vocabulary. `/search` reaches all of OpenStreetMap; this is what
+# the picker shows before anyone has typed, and the answer to "where can I go from here".
 PLACES_RAW = [
     ("Melbourne Central", -37.81001, 144.96280),
     ("Federation Square", -37.81800, 144.96910),
@@ -368,9 +379,73 @@ def health():
             "provenance": next((v.get("prov") for v in ENG.values()), None)}
 
 
+def _place(name, lat, lon, address=None, kind=None, snap_m=None):
+    """The one shape the client's `Place` maps to, whoever produced it -- the curated
+    list, an OSM search hit, or a reverse-geocoded GPS fix."""
+    return {"name": name, "lat": round(float(lat), 6), "lon": round(float(lon), 6),
+            "address": address, "kind": kind,
+            "snap_m": None if snap_m is None else round(float(snap_m), 1)}
+
+
 @app.get("/places")
 def places():
-    return [{"name": p["name"], "lat": p["lat"], "lon": p["lon"]} for p in S["places"]]
+    """The starter list. Kept because an empty search box needs something in it."""
+    return [_place(p["name"], p["lat"], p["lon"], kind="landmark", snap_m=p["snap_m"])
+            for p in S["places"]]
+
+
+@app.get("/search")
+def search(q: str = Query("", max_length=120), limit: int = Query(8, ge=1, le=20)):
+    """Free-text place search over OpenStreetMap, filtered to what ShadeMe can route.
+
+    An empty box returns the curated list rather than an empty screen, so the picker has
+    one code path. Anything else goes to the geocoder, and every match is then snapped to
+    the graph: `outside` counts the ones that matched the words but landed further than
+    SEARCH_SNAP_M from any walkable street, which is the difference between "there is no
+    such place" and "it exists, and it is not in the CBD". The client says which.
+    """
+    q = " ".join(q.split())
+    if len(q) < 2:
+        return {"query": q, "results": places(), "outside": 0, "source": "curated"}
+    try:
+        rows = geocode.search(q)
+    except geocode.GeocodeError as e:
+        print(f"[shademe] place search failed: {e}")
+        raise HTTPException(502, "Place search is unavailable right now. Pick one of the "
+                                 "suggested places, or try again in a moment.")
+    results, outside, seen = [], 0, set()
+    for r in rows:
+        node, d = nearest(r["lat"], r["lon"], SEARCH_SNAP_M)
+        if node is None:
+            outside += 1
+            continue
+        # DEDUPE ON WHAT IS RENDERED, not on identity. OSM splits a long road into a way
+        # per block, so "collins st" comes back as several Collins Streets; where their
+        # suburbs differ those are real choices, and where they do not the user is shown
+        # the same two lines twice and has no way to pick between them. Neither provider
+        # catches this, nor the shop mapped as both a node and a way.
+        key = (r["name"].lower(), (r["address"] or "").lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(_place(r["name"], r["lat"], r["lon"], address=r["address"],
+                              kind=r["kind"], snap_m=d))
+        if len(results) >= limit:
+            break
+    return {"query": q, "results": results, "outside": outside,
+            "source": rows[0]["source"] if rows else "none"}
+
+
+@app.get("/reverse")
+def reverse(lat: float, lon: float):
+    """Name a GPS fix. THE COORDINATES ARE RETURNED UNCHANGED -- only the label comes from
+    OSM. Routing from the centroid of whatever building the fix landed in would move the
+    user somewhere they did not ask to start from, without telling them."""
+    node, d = nearest(lat, lon, SEARCH_SNAP_M)
+    r = geocode.reverse(lat, lon)
+    return dict(_place(r["name"] if r else "My location", lat, lon,
+                       address=r["address"] if r else None, kind="here", snap_m=d),
+                in_coverage=node is not None)
 
 
 @app.get("/conditions")
