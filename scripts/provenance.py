@@ -160,7 +160,16 @@ def stamp(mode="summer", hours=range(6, 21)):
                                       "sha": sha(p, cache)}
             except Exception:
                 s["weather"][name] = {"sha": sha(p, cache)}
-    s["demo_day"] = os.environ.get("SHADEME_SUMMER_DATE", "2026-01-26")
+    # Read the LIVE value, not the environment variable that is only one way of setting
+    # it. server/main.py overrides weather.SUMMER_DATE at import so the API prices today
+    # while scripts/ keep the pinned demo day; re-reading the env var here stamped
+    # "demo day 2026-01-26" onto routes actually costed on today's weather -- a figure
+    # carrying someone else's config, which is the failure this module exists to prevent.
+    try:
+        from server.weather import SUMMER_DATE as _sd
+        s["demo_day"] = _sd
+    except Exception:
+        s["demo_day"] = os.environ.get("SHADEME_SUMMER_DATE", "2026-01-26")
 
     # --- the bias correction applied to that weather -----------------------------
     # Every temperature the engine reports now passes through this, so a figure quoted

@@ -17,7 +17,7 @@ export function ConditionChips({ conditions }: { conditions: Conditions | null }
   const uvColor = uv.tone === 'low' ? theme.shade : theme.sun;
 
   return (
-    <View className="flex-row gap-2">
+    <View className="flex-row flex-wrap items-start gap-2">
       <Card className="flex-row items-center gap-2.5 px-3 py-2">
         <Ionicons
           name={conditionIcon[conditions.condition] as any}
@@ -42,6 +42,17 @@ export function ConditionChips({ conditions }: { conditions: Conditions | null }
           {uv.label}
         </Text>
       </Card>
+
+      {/* Only ever shown when the engine is NOT pricing today. The reading would
+          otherwise read as live while being a pinned archive day. */}
+      {!conditions.is_today ? (
+        <Card className="justify-center px-3 py-2">
+          <Text className="text-[11px] leading-tight text-ink-soft">Not today</Text>
+          <Text className="text-[13px] font-medium leading-4 text-ink dark:text-paper">
+            {conditions.date}
+          </Text>
+        </Card>
+      ) : null}
     </View>
   );
 }

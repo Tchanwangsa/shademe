@@ -8,6 +8,9 @@ export interface Conditions {
   hour: number;
   /** True when the wall clock fell outside 06:00-20:00 and was pulled into it. */
   clamped: boolean;
+  /** The day actually priced. Today unless SHADEME_SUMMER_DATE pins it. */
+  date: string;
+  is_today: boolean;
   temperature: number;
   apparent_temperature: number;
   uv_index: number;

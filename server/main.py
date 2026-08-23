@@ -29,6 +29,20 @@ from . import routing                                                        # n
 from . import hours                                                          # noqa: E402
 from .cost import summarise, segments, thermal_summary, compare_thermal      # noqa: E402
 
+# THE API SERVES TODAY. weather.SUMMER_DATE is pinned to a January demo day so that the
+# benchmarks and the provenance ladder stay reproducible -- scripts/ import weather
+# directly and must keep getting that fixed day. The live API is the one place that
+# should not: pricing the current hour against a day seven months ago is exactly the
+# "real time" half-truth this rewrite was meant to remove. Overriding the constant here
+# leaves every script untouched, and the archive call for today simply misses (the
+# archive lags a few days) and falls through to the forecast endpoint, which serves it.
+#
+# The shade set follows wx["date"], so the first request on a new day regenerates it
+# (~13 s) rather than costing today's walk on January shadows.
+if not os.environ.get("SHADEME_SUMMER_DATE"):
+    import pandas as _pd
+    weather.SUMMER_DATE = str(_pd.Timestamp.now(tz=weather.TZ).date())
+
 # The shade rasters cover 06:00-20:00. Outside it we clamp and say so in `meta.clamped`
 # rather than quietly pricing 23:00 on the 20:00 sun.
 FIRST_HOUR, LAST_HOUR = 6, 20
@@ -124,15 +138,8 @@ def startup():
         print(f"[laneway] weather: {weather.block(now_hour(), 'summer')['source']}")
     except Exception as e:
         print(f"[laneway] weather prewarm failed: {e}")
-    # Stamped once and handed back on every response, so a figure screenshotted out of
-    # the app carries the graph, rasters and K that produced it.
-    try:
-        import provenance as _p
-        S["prov"] = _p.line()
-        print(f"[laneway] provenance {S['prov']}")
-    except Exception as e:
-        S["prov"] = None
-        print(f"[laneway] provenance stamp failed: {e}")
+    # NO PROVENANCE STAMP HERE. It cannot be known until a request fixes the day, and
+    # therefore the shade set. It is stamped in engine_state() instead.
 
 
 # --- time and conditions --------------------------------------------------------
@@ -172,6 +179,11 @@ def conditions_block():
         "as_of": t.isoformat(),
         "hour": h,
         "clamped": h != t.hour,
+        # The day actually priced. Normally today; pinned only if SHADEME_SUMMER_DATE is
+        # set. Exposed so the client can say which day it is showing rather than imply
+        # the reading is live when it is not.
+        "date": weather.SUMMER_DATE,
+        "is_today": weather.SUMMER_DATE == str(t.date()),
         "temperature": w["temperature"],
         "apparent_temperature": w["apparent_temperature"],
         "uv_index": w["uv_index"],
@@ -212,10 +224,32 @@ def engine_state():
     t0 = time.time()
     E = _e.edge_index(S["G"], mode=sk)
     _e.attach_tsurf(E, S["G"], wx, mode=sk)
-    st = {"E": E, "wx": wx, "key": key, "solved": {}, "applied": None}
+    st = {"E": E, "wx": wx, "key": key, "solved": {}, "applied": None,
+          "prov": _provenance_for(sk)}
     ENG["summer"] = st
     print(f"[laneway] engine state built in {time.time() - t0:.1f}s")
+    print(f"[laneway] provenance {st['prov']}")
     return st
+
+
+def _provenance_for(shade_key):
+    """Stamp the config for the shade set ACTUALLY being priced.
+
+    Stamping once at startup against the default mode was wrong in a way the stamp
+    exists to catch: `provenance.stamp()` defaults to mode="summer", which resolves to
+    out/v2 (sun 2026-01-26), while a request today resolves through _dirs_for() to
+    out/v2_winter (sun 2026-08-22). The response would have carried a January shade
+    digest next to a route costed on August shadows -- a figure quoted with someone
+    else's config, which is worse than a figure quoted with none.
+
+    Digests are cached on (size, mtime), so this is only expensive the first time.
+    """
+    try:
+        import provenance as _p
+        return _p.line(_p.stamp(mode=shade_key))
+    except Exception as e:
+        print(f"[laneway] provenance stamp failed: {e}")
+        return None
 
 
 def apply_hour(h, w):
@@ -264,7 +298,10 @@ def health():
         raise HTTPException(503, "graph not loaded")
     return {"ok": True, "nodes": G.number_of_nodes(), "edges": G.number_of_edges(),
             "graph_source": S["source"], "places": len(S["places"]),
-            "hour": now_hour(), "provenance": S.get("prov")}
+            "hour": now_hour(), "date": weather.SUMMER_DATE,
+            # None until the first route request builds an engine state -- there is no
+            # config to report before one has been chosen.
+            "provenance": (ENG.get("summer") or {}).get("prov")}
 
 
 @app.get("/places")
@@ -295,7 +332,7 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
     if s is None or t is None:
         raise HTTPException(400, f"point off the pedestrian network "
                                  f"(start {ds:.0f} m, end {dt:.0f} m from nearest node)")
-    apply_hour(h, w)
+    st = apply_hour(h, w)
 
     # Walk the K ladder. solve() is cached per hour, so each extra K is one more A* over
     # a graph that is already warm -- a few ms, not a few seconds.
@@ -396,8 +433,9 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
             "availability": dict(hours.describe(h, dw), enforced=respect_hours),
             "detour_cap": routing.DETOUR_CAP,
             # Additive and deliberately on every response: any number taken out of this
-            # API is only evidence alongside the config that made it.
-            "provenance": S.get("prov"),
+            # API is only evidence alongside the config that made it. Taken from the
+            # engine state so it describes the shade set this route was priced on.
+            "provenance": st["prov"],
             "ms": round((time.time() - t0) * 1000, 1),
         },
     }
