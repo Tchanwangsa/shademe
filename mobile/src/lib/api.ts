@@ -124,6 +124,12 @@ export interface RoutesMeta {
   unlabelled_dropped: number;
   availability: { dow: string; hour: number; closed_classes: string[]; enforced: boolean };
   detour_cap: number;
+  /** True when the surface-temperature march was still rebuilding, so this was priced on
+   * the previous one. Conditions are live either way; only the ground lags, by at most
+   * one weather refresh. */
+  engine_stale: boolean;
+  /** The weather fetch those surface temperatures came from. */
+  engine_as_of: string | null;
   provenance: string | null;
   ms: number;
 }
@@ -138,15 +144,25 @@ export interface Place {
   name: string;
   lat: number;
   lon: number;
-  /** The muted second line -- street, suburb. Null on the curated list, where the name
-   * is already the whole answer. */
+  /** The muted second line -- street, suburb. */
   address?: string | null;
   /** OSM's own word for the thing: pedestrian, marketplace, station, cafe. Drives the
-   * glyph in the picker. "landmark" for the curated list, "here" for a GPS fix. */
+   * glyph in the picker. "here" for a GPS fix. */
   kind?: string | null;
+  /** OSM's raw `opening_hours` tag, or null where the place carries none. */
+  opening_hours?: string | null;
+  /** Whether OSM's hours say it is open at the moment the server answered.
+   *
+   * THREE-VALUED, and null is a real answer meaning "not known" -- most OSM places carry
+   * no opening_hours at all, and a street never will. Render a badge only for `false`;
+   * treating null as closed would put Closed on half the CBD. */
+  open_now?: boolean | null;
   /** How far the nearest walkable node is. The engine routes from there, not from the
    * pin, and for a big place like a station the two differ by a block. */
   snap_m?: number | null;
+  /** Straight-line metres from whatever origin the search was given, or null when it
+   * was given none. NOT the walking distance -- /routes owns that, and it is longer. */
+  distance_m?: number | null;
 }
 
 export interface SearchResponse {
@@ -155,7 +171,7 @@ export interface SearchResponse {
   /** Matches that fit the words but landed outside the CBD the graph covers. The
    * difference between "no such place" and "not one we can walk you to". */
   outside: number;
-  source: 'curated' | 'photon' | 'nominatim' | 'none';
+  source: 'photon' | 'nominatim' | 'none';
 }
 
 /** A GPS fix, named. `lat`/`lon` come back exactly as sent -- only the label is OSM's. */
@@ -192,11 +208,21 @@ async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
 }
 
 export const api = {
-  places: (signal?: AbortSignal) => get<Place[]>('/places', signal),
   /** Free-text place search over OpenStreetMap, already filtered to what the engine can
-   * route. A query under two characters comes back as the curated list. */
-  search: (q: string, signal?: AbortSignal) =>
-    get<SearchResponse>(`/search?q=${encodeURIComponent(q)}`, signal),
+   * route. A query under two characters comes back empty -- there is no curated list any
+   * more, and the picker shows the device's own recent picks in that space instead.
+   *
+   * `near` is optional, and when it is given the results come back nearest first with a
+   * distance on each. It is the only thing that separates five Hungry Jack's whose name
+   * and street both read the same. */
+  search: (q: string, near?: { lat: number; lon: number } | null, signal?: AbortSignal) => {
+    const p = new URLSearchParams({ q });
+    if (near) {
+      p.set('near_lat', String(near.lat));
+      p.set('near_lon', String(near.lon));
+    }
+    return get<SearchResponse>(`/search?${p.toString()}`, signal);
+  },
   reverse: (lat: number, lon: number, signal?: AbortSignal) =>
     get<ReverseResponse>(`/reverse?lat=${lat}&lon=${lon}`, signal),
   conditions: (signal?: AbortSignal) => get<Conditions>('/conditions', signal),

@@ -97,11 +97,16 @@ def _get(host, url, params):
         return data
 
 
-def _row(name, address, kind, lat, lon, source):
+def _row(name, address, kind, lat, lon, source, hours=None, osm=None):
     """The one shape both providers normalise to, so main.py never branches on which
-    answered. `kind` is OSM's own word for the thing -- pedestrian, marketplace, station."""
-    return {"name": name, "address": address, "kind": kind,
-            "lat": float(lat), "lon": float(lon), "source": source}
+    answered. `kind` is OSM's own word for the thing -- pedestrian, marketplace, station.
+
+    `hours` is OSM's raw `opening_hours` tag or None. ONLY NOMINATIM CARRIES IT: Photon's
+    response has no tag fields at all (measured -- its properties stop at osm_id, name and
+    the address parts), so every Photon row reports None and the client shows no badge
+    rather than a wrong one. api/osm_hours.py turns the string into open/closed."""
+    return {"name": name, "address": address, "kind": kind, "hours": hours,
+            "osm": osm, "lat": float(lat), "lon": float(lon), "source": source}
 
 
 def _join(*parts):
@@ -132,9 +137,11 @@ def _photon(q, limit):
         kind = p.get("osm_value")
         if kind in (None, "yes"):
             kind = p.get("osm_key") or p.get("type")
+        t, oid = (p.get("osm_type") or "").upper(), p.get("osm_id")
         out.append(_row(name, _join(street if (street and street not in name) else None,
                                     p.get("district"), p.get("city")),
-                        kind, c[1], c[0], "photon"))
+                        kind, c[1], c[0], "photon",
+                        osm=f"{t}{oid}" if t in ("N", "W", "R") and oid else None))
     return out
 
 
@@ -171,6 +178,8 @@ def _nominatim_context(r, name):
 def _nominatim(q, limit):
     rows = _get("nominatim", f"{NOMINATIM}/search", {
         "q": q, "format": "jsonv2", "addressdetails": "1", "namedetails": "1",
+        # extratags is what carries opening_hours. Free on the same request.
+        "extratags": "1",
         "dedupe": "1", "limit": str(limit), "countrycodes": "au",
         "viewbox": f"{W},{Sy},{E},{N}", "bounded": "0",
     })
@@ -185,7 +194,8 @@ def _nominatim(q, limit):
         if kind in (None, "yes", "house"):
             kind = r.get("category") or r.get("class") or kind
         out.append(_row(name, _nominatim_context(r, name), kind,
-                        r["lat"], r["lon"], "nominatim"))
+                        r["lat"], r["lon"], "nominatim",
+                        hours=(r.get("extratags") or {}).get("opening_hours")))
     return out
 
 
@@ -242,3 +252,44 @@ def reverse(lat, lon):
     if not name:
         return None
     return _row(name, _nominatim_context(r, name), "here", lat, lon, "nominatim")
+
+
+# --- opening hours --------------------------------------------------------------
+
+# Nominatim's batch lookup takes up to 50 OSM ids at once. Keep well under it: this only
+# ever runs on the handful of rows that survived the graph filter and the limit.
+LOOKUP_MAX = 20
+
+
+def fill_hours(rows):
+    """Fill `hours` on rows that have an OSM id but no tag yet. Mutates and returns rows.
+
+    WHY THIS EXISTS: Photon answers first because it matches prefixes, and Photon's
+    response carries no tags at all -- measured, its properties stop at osm_id, name and
+    the address parts. So without this every row from a type-ahead reports "hours
+    unknown" and no place is ever shown as closed. Nominatim's /lookup returns extratags
+    for many ids in ONE request, so the whole page costs a single extra call, cached for
+    TTL like everything else here.
+
+    BEST EFFORT, NEVER FATAL. A failed or slow lookup leaves `hours` None, which renders
+    as no badge. Search results must not depend on it.
+    """
+    want = [r for r in rows if r.get("osm") and not r.get("hours")][:LOOKUP_MAX]
+    if not want:
+        return rows
+    try:
+        got = _get("nominatim", f"{NOMINATIM}/lookup", {
+            "osm_ids": ",".join(r["osm"] for r in want),
+            "format": "jsonv2", "extratags": "1",
+        })
+    except GeocodeError as e:
+        print(f"[geocode] hours lookup failed: {e}")
+        return rows
+    by_id = {}
+    for r in got if isinstance(got, list) else []:
+        t, oid = (r.get("osm_type") or "")[:1].upper(), r.get("osm_id")
+        if t and oid:
+            by_id[f"{t}{oid}"] = (r.get("extratags") or {}).get("opening_hours")
+    for r in want:
+        r["hours"] = by_id.get(r["osm"])
+    return rows

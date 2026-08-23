@@ -15,6 +15,7 @@ import { ConditionChips } from './src/components/ConditionChips';
 import { OptionCard } from './src/components/OptionCard';
 import { OptionDetail } from './src/components/OptionDetail';
 import { PlacePicker } from './src/components/PlacePicker';
+import { addRecent } from './src/lib/recents';
 import { RouteMap } from './src/components/RouteMap';
 
 /** Conditions are re-read on this cadence. The engine prices the wall clock, so the
@@ -72,13 +73,15 @@ function ShadeMe() {
   const insets = useSafeAreaInsets();
   const sheet = useRef<BottomSheet>(null);
 
-  const [places, setPlaces] = useState<Place[]>([]);
   const [conditions, setConditions] = useState<Conditions | null>(null);
   const [from, setFrom] = useState<Place | null>(null);
   const [to, setTo] = useState<Place | null>(null);
   const [routes, setRoutes] = useState<RoutesResponse | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [picking, setPicking] = useState<'from' | 'to' | null>(null);
+  // The last GPS fix we are allowed to have. Only ever the fallback for "how far is
+  // that?" in the picker -- routing still uses whatever the user actually picked.
+  const [here, setHere] = useState<{ lat: number; lon: number } | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [detent, setDetent] = useState(1);
@@ -91,12 +94,22 @@ function ShadeMe() {
   const sheetHeight =
     windowHeight * Math.min(DETENTS[detent] ?? DETENTS[1], MAX_SHEET_FRACTION);
 
-  // The curated landmarks. Only a fallback now that the picker searches OpenStreetMap:
-  // it is what fills the list before the first search response lands.
+  // A last-known fix, asked for ONLY if permission has already been granted --
+  // getForegroundPermissionsAsync reads the current state without prompting, so opening
+  // the app never puts up a location dialog nobody asked for. It is cached by the OS, so
+  // this costs nothing and it means the picker can say how far away things are before
+  // either end of the trip has been chosen.
   useEffect(() => {
-    const ac = new AbortController();
-    api.places(ac.signal).then(setPlaces).catch((e: ApiError) => setError(e.message));
-    return () => ac.abort();
+    let alive = true;
+    (async () => {
+      const { granted } = await Location.getForegroundPermissionsAsync();
+      if (!granted || !alive) return;
+      const pos = await Location.getLastKnownPositionAsync({});
+      if (pos && alive) setHere({ lat: pos.coords.latitude, lon: pos.coords.longitude });
+    })().catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -146,6 +159,7 @@ function ShadeMe() {
     }
     const pos = await Location.getCurrentPositionAsync({});
     const { latitude: lat, longitude: lon } = pos.coords;
+    setHere({ lat, lon });
     // Name the fix from OpenStreetMap, but keep the user's own coordinates: routing from
     // the centroid of whatever building the fix landed in would move them without saying
     // so. A failed lookup is not a failed fix -- fall back to the plain label and let
@@ -262,11 +276,17 @@ function ShadeMe() {
       <PlacePicker
         visible={picking !== null}
         title={picking === 'from' ? 'Starting point' : 'Destination'}
-        places={places}
+        // Measured from the OTHER end of the trip when there is one -- picking a
+        // destination, "how far" means how far from where the walk starts -- and from the
+        // phone otherwise. Null before either exists, and then no distances are shown.
+        origin={(picking === 'from' ? to : from) ?? here}
         onPick={(p) => {
           if (picking === 'from') setFrom(p);
           else setTo(p);
           setPicking(null);
+          // Fire and forget: the pick has already been applied, and a device that cannot
+          // write its recents file should still be able to plan a walk.
+          void addRecent(p);
         }}
         onClose={() => setPicking(null)}
         onUseLocation={picking === 'from' ? useMyLocation : undefined}
