@@ -1,0 +1,25 @@
+# Local run of the deployable image. Same artifact you push to a host.
+#
+#   docker compose up --build      # first time: builds the pipeline, takes a while
+#   docker compose up              # after that: starts in seconds
+#
+# Then point the app at http://localhost:8011 (EXPO_PUBLIC_API_BASE in mobile/.env).
+
+services:
+  api:
+    build: .
+    ports:
+      - "8011:8011"
+    environment:
+      # Lock the priced day for a demo; leave unset to price today.
+      # SHADEME_DATE: "2026-01-26"
+      SHADEME_CORS_ORIGINS: "*"
+    # Measured ~585 MB steady state once the graph and rasters are loaded, plus the
+    # surface-energy march on top. Below ~1.5 GB the container gets OOM-killed mid-route.
+    mem_limit: 2g
+    restart: unless-stopped
+
+# No volume on /app/out, deliberately. out/ ships INSIDE the image, and the container's
+# own writable layer is enough for the shade set the engine regenerates when the date
+# rolls over. A named volume here would be seeded from the image once and then win over
+# every later rebuild, so a fresh `docker build` would silently keep serving old rasters.

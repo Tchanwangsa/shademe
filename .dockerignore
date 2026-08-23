@@ -1,14 +1,27 @@
 .git
 .venv
-out
 mobile
 tests
 tools
+**/__pycache__
+*.pyc
+.DS_Store
+
+# out/ is rebuilt inside the image by shademe.pipeline.build_all. Sending the host's
+# 1.7 GB copy as build context would only slow the build down.
+out
+
+# Same for the downloaded sources -- the builder stage fetches them. Only the three
+# hand-authored files under data/ are kept, because nothing can regenerate them:
+# connectors.json, indoor_hours.json, openmeteo_bias.json.
+data/*.geojson
+data/osm_walk.json
+data/osm_landcover.json
+data/uv_cache.json
+data/weather_cache_*.json
+data/weather_eb_*.json
+data/connectors.proposed.json
 data/isd
 data/radiation
 data/openmeteo_sites
 data/*.csv
-data/weather_cache_*.json
-**/__pycache__
-*.pyc
-.DS_Store
