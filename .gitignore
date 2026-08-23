@@ -1,50 +1,42 @@
 .DS_Store
 .venv/
 __pycache__/
-data/*.geojson
-data/*.json
-data/weather_cache_*.json
+*.pyc
+
+# --- derived, regenerable, or too big for git --------------------------------
+# out/ is everything the pipeline builds: DSMs, shade rasters, SVF, materials, the
+# routing graph. ~1 GB, rebuilt by `python -m shademe.pipeline.*`.
 out/*.npy
-out/*.png
-# derived caches: regenerated in ~45 s by server/engine.attach_tsurf(), 166 MB each
-# as rasters. These were NOT covered by out/*.npy and 1.7 GB of them had accumulated.
 out/*.npz
+out/*.png
+out/*.pkl
+out/*.pkl.bak
 out/v2/
 out/v2_winter/
 out/v2_cold/
-!data/connectors.json
-!out/grid.json
-
-# Downloaded ground-truth tables: 172 MB, re-fetched by validate_sensors.fetch_all().
-# microclimate_sensors.csv alone is 162 MB, over GitHub's 100 MB per-file hard limit.
-data/*.csv
-# Built by scripts/build_graph.py; 18 MB each and regenerable.
-out/*.pkl
-out/*.pkl.bak
-
-# Provenance outputs: both are DERIVED and deliberately not stored. The digest cache is
-# keyed on (size, mtime) and rebuilds itself; the ladder results rebuild from the DSMs in
-# ~40 s. Checking a baseline in is what created the moving-yardstick problem in the first
-# place -- see the Provenance section of ENGINE_CONTRACT.md.
+out/day_*/
 out/.provenance_cache.json
 out/bench_shade_ladder*.json
+!out/grid.json
 
-# The fitted Open-Meteo bias table IS checked in (~6 KB). It is derived, but it cannot be
-# regenerated from anything in this repo: the fit needs microclimate_sensors.csv, which is
-# 162 MB and excluded above. Leaving it out means a fresh clone silently serves the raw
-# uncorrected feed -- exactly the failure server/weather.py reports `bias_mode` to prevent.
-!data/openmeteo_bias.json
-
-# Hand-authored, not derived: opening hours for the protected network. Nothing in the
-# repo can regenerate it -- OSM carries opening_hours on 2 of 1232 indoor ways, so the
-# table is written by hand and losing it means the availability gate silently degrades
-# to "everything is always open", which is the bug it exists to fix.
-!data/indoor_hours.json
-
-# Shade sets generated on demand for a request date (server/engine.ensure_shade_set).
-# ~350 MB each, regenerated in ~13 s, pruned to SHADEME_SHADE_CACHE.
-out/day_*/
-# Fetched reference data for the weather-source evaluations.
+# Source geojson/json fetched by shademe.pipeline.fetch and .fetch_osm.
+data/*.geojson
+data/*.json
+data/weather_cache_*.json
+# Ground-truth tables: 172 MB, re-fetched by tools/validate_sensors.py. The
+# microclimate CSV alone is 162 MB, over GitHub's 100 MB per-file limit.
+data/*.csv
 data/isd/
 data/radiation/
 data/openmeteo_sites/
+
+# --- kept, despite the rules above -------------------------------------------
+# Hand-authored indoor links between arcade components. Nothing can regenerate them.
+!data/connectors.json
+# Hand-authored opening hours. OSM carries opening_hours on 2 of 1232 indoor ways, so
+# losing this silently degrades the availability gate to "everything is always open".
+!data/indoor_hours.json
+# The fitted Open-Meteo bias table (~6 KB). Derived, but not regenerable from this
+# repo: the fit needs the 162 MB microclimate CSV excluded above. Leaving it out makes
+# a fresh clone serve the raw uncorrected feed.
+!data/openmeteo_bias.json

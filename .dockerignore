@@ -1,0 +1,14 @@
+.git
+.venv
+out
+mobile
+tests
+tools
+data/isd
+data/radiation
+data/openmeteo_sites
+data/*.csv
+data/weather_cache_*.json
+**/__pycache__
+*.pyc
+.DS_Store
