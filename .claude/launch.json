@@ -2,22 +2,12 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "shademe-web",
-      "runtimeExecutable": "npm",
-      "runtimeArgs": [
-        "--prefix",
-        "app",
-        "run",
-        "dev"
-      ],
-      "port": 3000,
-      "autoPort": true
-    },
-    {
-      "name": "shademe-api",
+      "name": "laneway-api",
       "runtimeExecutable": "/Users/tanatchanwangsa/Documents/melbournehack26/.venv/bin/uvicorn",
       "runtimeArgs": [
         "server.main:app",
+        "--host",
+        "0.0.0.0",
         "--port",
         "8011"
       ],

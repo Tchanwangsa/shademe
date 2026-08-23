@@ -1,22 +1,50 @@
-"""ShadeMe API. FastAPI + preloaded graph. See CONTRACT.md."""
-import os, sys, json, time, pickle
+"""Laneway API. Real-time cool-route options for the Melbourne CBD.
+
+The physics lives in engine/cost/routing/weather/hours and is unchanged. This module is
+only the surface the mobile client talks to, and it makes three commitments the old
+demo API did not:
+
+  * REAL TIME, NOT A SCRUBBER. There is no `hour` parameter. Every request is priced at
+    the wall clock in Australia/Melbourne, clamped to the 06..20 window the shade rasters
+    cover. A demo that can be dialled to its best hour is not evidence.
+  * OPTIONS, NOT A PAIR. `/routes` walks a ladder of K -- the single thermal-preference
+    knob -- and returns the distinct paths that fall out of it. Two K values that produce
+    the same walk collapse to one option, which is the honest answer when there is no
+    cooler way to go.
+  * NO FIGURE WITHOUT ITS CONFIG. `meta.provenance` rides on every response.
+"""
+import os, sys, time, pickle
+from datetime import datetime
+
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-OUT, DATA, WEB = f"{ROOT}/out", f"{ROOT}/data", f"{ROOT}/web"
+OUT, DATA = f"{ROOT}/out", f"{ROOT}/data"
 sys.path.insert(0, f"{ROOT}/scripts")
 
-from . import weather                                        # noqa: E402
-from .cost import summarise, segments, geojson, thermal_summary, compare_thermal              # noqa: E402
-from . import routing                                        # noqa: E402
-from . import hours                                          # noqa: E402
+from . import weather                                                        # noqa: E402
+from . import routing                                                        # noqa: E402
+from . import hours                                                          # noqa: E402
+from .cost import summarise, segments, thermal_summary, compare_thermal      # noqa: E402
 
-HOURS = list(range(6, 21))
-DEMO_HOUR = 16
+# The shade rasters cover 06:00-20:00. Outside it we clamp and say so in `meta.clamped`
+# rather than quietly pricing 23:00 on the 20:00 sun.
+FIRST_HOUR, LAST_HOUR = 6, 20
+FALLBACK_HOUR = 16          # only for the graph-rebuild path, never for pricing
+
+# The thermal-preference ladder. K is the one free knob in the cost function; 0 is
+# "shortest, no preference" (routing.route_utci short-circuits to the plain shortest path)
+# and 0.30 is about as far as the 1.4x detour cap will let a route wander.
+K_LADDER = (0.0, 0.03, 0.10, 0.30)
+
+# Two options closer than both of these are the same walk as far as the walker is
+# concerned, and are shown as one card. 1 minute and 5 degC-minutes: below the
+# resolution of a walking-time estimate, and below the dose of a single street crossing.
+SAME_WALK_MIN = 1.0
+SAME_WALK_DOSE = 5.0
+
 PLACES_RAW = [
     ("Melbourne Central", -37.81001, 144.96280),
     ("Federation Square", -37.81800, 144.96910),
@@ -35,84 +63,25 @@ PLACES_RAW = [
     ("Melbourne Museum", -37.80330, 144.97150),
 ]
 
-S = {}          # module state: graph, node arrays, places
+S = {}          # graph, node arrays, places, provenance
+ENG = {}        # per-mode engine state (edge index + surface march), built lazily
 
 
-def _shade_grid(hour, day=None):
-    """Fallback path only: compute one hour's shade grid the way proto_route.py does.
-
-    `day` used to be pinned to 2026-01-14 -- a date that appears nowhere else in the
-    codebase and is twelve days off the demo day everything else uses. It now defaults
-    to the day actually being priced.
-    """
-    import pandas as pd
-    from config import CELL
-    from shadow import sun_position, shade_factor
-    grid = json.load(open(f"{OUT}/grid.json"))
-    day = day or weather.get("summer").get("date") or weather.SUMMER_DATE
-    when = pd.Timestamp(f"{day} {hour:02d}:00", tz=weather.TZ)
-    az, el = sun_position(when)
-    dsm_c = np.load(f"{OUT}/dsm_canopy.npy")
-    # Fallback path, pinned to the v1 flat canopy: zeros == legacy crown-to-pavement.
-    # The served rasters are out/v2/, built by scripts/regen_shade_v2.py with the
-    # real crown base from out/dsm_canopy_base_v2.npy.
-    sh = shade_factor(np.load(f"{OUT}/dsm_buildings.npy"), dsm_c,
-                      np.zeros_like(dsm_c), CELL, az, el)
-    return sh, grid
-
-
-def _sample_one_hour(G, sh, grid, hour, n=8):
-    """Fallback shade sampling: edge['shade'] = {hour: float}, same recipe as proto_route."""
-    minx, miny, maxx, maxy = grid["bounds"]
-    from config import CELL
-    H, W = sh.shape
-    sun = []
-    for u, v, d in G.edges(data=True):
-        if d.get("indoor") or d.get("covered"):
-            d["shade"] = {hour: 1.0}
-        else:
-            sun.append((u, v))
-    if not sun:
-        return
-    xy = np.array([[G.nodes[u]["xy"], G.nodes[v]["xy"]] for u, v in sun])
-    f = ((np.arange(n) + 0.5) / n)[None, :, None]
-    pts = xy[:, 0][:, None, :] + (xy[:, 1] - xy[:, 0])[:, None, :] * f
-    r = ((maxy - pts[..., 1]) / CELL).astype(np.int32)
-    c = ((pts[..., 0] - minx) / CELL).astype(np.int32)
-    inside = (r >= 0) & (r < H) & (c >= 0) & (c < W)
-    flat = np.clip(r, 0, H - 1) * W + np.clip(c, 0, W - 1)
-    cnt = np.maximum(inside.sum(1), 1)
-    vals = (sh.ravel()[flat] * inside).sum(1) / cnt
-    for (u, v), s in zip(sun, vals):
-        G[u][v]["shade"] = {hour: float(s)}
-
+# --- graph ----------------------------------------------------------------------
 
 def load_graph():
     p = f"{OUT}/graph.pkl"
     if os.path.exists(p):
-        G = pickle.load(open(p, "rb"))
-        return G, f"out/graph.pkl ({time.strftime('%H:%M', time.localtime(os.path.getmtime(p)))})"
-    import inspect, build_graph
-    if "sample" in inspect.signature(build_graph.build).parameters:      # Phase 2 signature
-        have = [h for h in HOURS if os.path.exists(f"{OUT}/shade_{h:02d}.npy")]
-        if have:
-            return build_graph.build(hours=have, verbose=False), \
-                   f"fallback build_graph.build() hourly shade {have[0]}-{have[-1]}"
-        G = build_graph.build(hours=[DEMO_HOUR], sample=False, verbose=False)
-        sh, grid = _shade_grid(DEMO_HOUR)
-        _sample_one_hour(G, sh, grid, DEMO_HOUR)
-    else:                                                                # Phase 0 signature
-        sh, grid = _shade_grid(DEMO_HOUR)
-        G = build_graph.build(sh, grid)
-    return G, f"fallback build_graph.build() single-hour shade @ {DEMO_HOUR}:00"
-
-
-def graph_hours(G):
-    for _, _, d in G.edges(data=True):
-        s = d.get("shade")
-        if isinstance(s, dict) and s:
-            return sorted(int(k) for k in s)
-    return HOURS
+        stamp = time.strftime("%H:%M", time.localtime(os.path.getmtime(p)))
+        return pickle.load(open(p, "rb")), f"out/graph.pkl ({stamp})"
+    import build_graph
+    have = [h for h in range(FIRST_HOUR, LAST_HOUR + 1)
+            if os.path.exists(f"{OUT}/shade_{h:02d}.npy")]
+    if not have:
+        raise RuntimeError("no graph.pkl and no hourly shade rasters -- run "
+                           "scripts/build_graph.py before starting the API")
+    return (build_graph.build(hours=have, verbose=False),
+            f"fallback build_graph.build() hourly shade {have[0]}-{have[-1]}")
 
 
 def nearest(lat, lon, max_m=None):
@@ -125,7 +94,7 @@ def nearest(lat, lon, max_m=None):
     return S["ids"][i], dist
 
 
-app = FastAPI(title="ShadeMe")
+app = FastAPI(title="Laneway")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
                    allow_headers=["*"])
 
@@ -138,85 +107,154 @@ def startup():
     import networkx as nx
     G, src = load_graph()
     main = G.graph.get("main") or max(nx.connected_components(G), key=len)
-    ids = list(main)                      # snap only to the main component; islands are traps
+    ids = list(main)                  # snap only to the main component; islands are traps
     xy = np.array([G.nodes[n]["xy"] for n in ids], dtype=float)
     S.update(G=G, ids=ids, X=xy[:, 0], Y=xy[:, 1], source=src,
-             tf=Transformer.from_crs(WGS84, MGA55, always_xy=True),
-             hours=graph_hours(G))
+             tf=Transformer.from_crs(WGS84, MGA55, always_xy=True))
     places, dropped = [], []
     for name, lat, lon in PLACES_RAW:
         n, d = nearest(lat, lon, 100.0)
         (places if n else dropped).append({"name": name, "lat": lat, "lon": lon,
                                            "node": n, "snap_m": round(d, 1)})
     S["places"] = places
-    print(f"[shademe] graph {G.number_of_nodes()} nodes / {G.number_of_edges()} edges "
-          f"from {src} in {time.time()-t0:.1f}s")
-    print(f"[shademe] places ok={len(places)} dropped={[d['name'] for d in dropped]}")
-    for m in ("summer", "winter"):                  # prewarm so the first demo call isn't 4s
-        try:
-            print(f"[shademe] weather {m}: {weather.block(DEMO_HOUR, m)['source']}")
-        except Exception as e:
-            print(f"[shademe] weather {m} prewarm failed: {e}")
-    # Stamp the config ONCE at startup and hand it back on every route, so a figure
-    # screenshotted out of the app carries the graph, rasters and K that produced it.
-    # Digests are cached on (size, mtime) in out/.provenance_cache.json.
+    print(f"[laneway] graph {G.number_of_nodes()} nodes / {G.number_of_edges()} edges "
+          f"from {src} in {time.time() - t0:.1f}s")
+    print(f"[laneway] places ok={len(places)} dropped={[d['name'] for d in dropped]}")
+    try:
+        print(f"[laneway] weather: {weather.block(now_hour(), 'summer')['source']}")
+    except Exception as e:
+        print(f"[laneway] weather prewarm failed: {e}")
+    # Stamped once and handed back on every response, so a figure screenshotted out of
+    # the app carries the graph, rasters and K that produced it.
     try:
         import provenance as _p
         S["prov"] = _p.line()
-        print(f"[shademe] provenance {S['prov']}")
+        print(f"[laneway] provenance {S['prov']}")
     except Exception as e:
         S["prov"] = None
-        print(f"[shademe] provenance stamp failed: {e}")
+        print(f"[laneway] provenance stamp failed: {e}")
 
 
-# --- v2 physical engine (additive; ?engine=utci) --------------------------------
-ENG = {}
+# --- time and conditions --------------------------------------------------------
+
+def now_local():
+    import pandas as pd
+    return pd.Timestamp.now(tz=weather.TZ)
 
 
-def _shade_key(wm, wx=None):
-    """What to hand engine as `mode`: the day being priced, else the legacy mode name."""
-    wx = wx if wx is not None else weather.get(wm)
-    return wx.get("date") or wm
+def now_hour():
+    return max(FIRST_HOUR, min(LAST_HOUR, now_local().hour))
 
 
-def _engine_state(mode):
-    """Per-mode engine state, rebuilt only when the weather payload changes.
+def condition_code(w):
+    """A coarse sky state for the client's weather glyph.
 
-    edge_index() is ~1 s; attach_tsurf() runs the ~38 s energy-balance march, so both are
-    done lazily on first use and cached, never at startup and never per request.
+    Derived from cloud cover and precipitation, not from an Open-Meteo weather code --
+    the cached payload does not carry one, and inventing a richer taxonomy than the
+    inputs support would be decoration.
+    """
+    if w["precipitation"] >= 0.5:
+        return "rain"
+    if w["precipitation"] > 0.0:
+        return "drizzle"
+    if w["cloud_cover"] >= 80:
+        return "cloudy"
+    if w["cloud_cover"] >= 30:
+        return "partly_cloudy"
+    return "sunny"
+
+
+def conditions_block():
+    h = now_hour()
+    w = weather.block(h, "summer")
+    t = now_local()
+    return {
+        "as_of": t.isoformat(),
+        "hour": h,
+        "clamped": h != t.hour,
+        "temperature": w["temperature"],
+        "apparent_temperature": w["apparent_temperature"],
+        "uv_index": w["uv_index"],
+        "condition": condition_code(w),
+        "cloud_cover": w["cloud_cover"],
+        "precipitation": w["precipitation"],
+        "wind_speed": w["wind_speed"],
+        "relative_humidity": w["relative_humidity"],
+        "direct_radiation": w["direct_radiation"],
+        # Kept visible: the level correction is the 28% win and the raw feed is what
+        # Open-Meteo actually said. A client that wants to show one must be able to
+        # tell them apart.
+        "temperature_raw": w["temperature_raw"],
+        "bias_mode": w["bias_mode"],
+        "ta_bias_offset": w["ta_bias_offset"],
+        "rh_is_fallback": w["rh_is_fallback"],
+        "source": w["source"],
+    }, w, h
+
+
+# --- engine state ---------------------------------------------------------------
+
+def engine_state():
+    """Edge index + surface energy-balance march, cached until the weather payload moves.
+
+    edge_index() is ~1 s and attach_tsurf() is the ~38 s march, so both are lazy: the
+    first route request pays for them, startup does not.
     """
     from . import engine as _e
-    wm = "summer" if mode != "winter" else "winter"
-    # The bias-corrected payload, not the raw one: attach_tsurf() marches the surface and
-    # facade energy balance off wx["hours"] directly, and it has to see the same air
-    # temperature the UTCI terms in solve() see. The bias mode is in the cache key so
-    # flipping SHADEME_BIAS_LEVEL rebuilds the march instead of silently reusing it.
-    wx = weather.apply_bias(weather.get(wm))
-    # THE SHADE SET FOLLOWS THE DATE, NOT THE MODE. `wm` still selects which weather
-    # payload to price; the sun geometry comes from the day that payload is for, so an
-    # October request can no longer be costed on January shadows. engine._dirs_for()
-    # accepts a YYYY-MM-DD here and generates the set if none on disk is close enough.
-    sk = _shade_key(wm, wx)
-    key = (wm, sk, wx.get("date"), wx.get("ts"), wx.get("bias", {}).get("mode"))
-    st = ENG.get(wm)
+    wx = weather.apply_bias(weather.get("summer"))
+    # THE SHADE SET FOLLOWS THE DATE BEING PRICED, not a mode name, so a request in
+    # October cannot be costed on January shadows.
+    sk = wx.get("date") or "summer"
+    key = (sk, wx.get("ts"), wx.get("bias", {}).get("mode"))
+    st = ENG.get("summer")
     if st and st["key"] == key:
         return st
     t0 = time.time()
     E = _e.edge_index(S["G"], mode=sk)
     _e.attach_tsurf(E, S["G"], wx, mode=sk)
     st = {"E": E, "wx": wx, "key": key, "solved": {}, "applied": None}
-    ENG[wm] = st
-    print(f"[shademe] engine state for {wm} built in {time.time()-t0:.1f}s")
+    ENG["summer"] = st
+    print(f"[laneway] engine state built in {time.time() - t0:.1f}s")
     return st
 
 
-def _hour(hour, mode):
-    if hour is not None:
-        return max(6, min(20, int(hour)))
-    if mode == "summer":
-        return DEMO_HOUR
-    import pandas as pd
-    return max(6, min(20, pd.Timestamp.now(tz=weather.TZ).hour))
+def apply_hour(h, w):
+    """Stash per-edge UTCI and stress on the graph for hour `h`. Cached per hour."""
+    from . import engine as _e
+    st = engine_state()
+    solved = st["solved"].get(h)
+    if solved is None:
+        solved = _e.solve(st["E"], w, st["wx"], h)
+        st["solved"][h] = solved
+    if st["applied"] != h:
+        _e.apply(S["G"], st["E"], solved)
+        st["applied"] = h
+    return st
+
+
+# --- routes ---------------------------------------------------------------------
+
+def describe(G, path, h, w):
+    """Everything one option needs, under the hour and weather already applied."""
+    out = summarise(G, path, h, w["direct_radiation"])
+    out.update(thermal_summary(G, path))
+    es = [G[u][v] for u, v in zip(path, path[1:])]
+    L = np.array([float(e["length"]) for e in es])
+    if L.sum() > 0:
+        gw = lambda k: float((np.array([e.get(k, np.nan) for e in es]) * L).sum() / L.sum())
+        out["utci_mean"] = round(gw("_utci"), 2)
+        out["mrt_mean"] = round(gw("_mrt"), 2)
+    # Time in unshaded outdoor sun, which is what a walker actually feels the length of.
+    out["sun_minutes"] = round(out["sun_m"] / 1.35 / 60.0, 1)
+    return out
+
+
+def label_for(opt, coolest_id, shortest_id):
+    if opt["id"] == coolest_id:
+        return "Coolest"
+    if opt["id"] == shortest_id:
+        return "Shortest"
+    return "Balanced"
 
 
 @app.get("/health")
@@ -224,8 +262,9 @@ def health():
     G = S.get("G")
     if G is None:
         raise HTTPException(503, "graph not loaded")
-    return {"ok": True, "edges": G.number_of_edges(), "nodes": G.number_of_nodes(),
-            "hours": S["hours"], "graph_source": S["source"], "places": len(S["places"])}
+    return {"ok": True, "nodes": G.number_of_nodes(), "edges": G.number_of_edges(),
+            "graph_source": S["source"], "places": len(S["places"]),
+            "hour": now_hour(), "provenance": S.get("prov")}
 
 
 @app.get("/places")
@@ -233,169 +272,132 @@ def places():
     return [{"name": p["name"], "lat": p["lat"], "lon": p["lon"]} for p in S["places"]]
 
 
-@app.get("/weather")
-def get_weather(hour: int = Query(None), mode: str = Query("summer")):
-    h = _hour(hour, mode)
-    return weather.block(h, mode)
+@app.get("/conditions")
+def get_conditions():
+    block, _, _ = conditions_block()
+    return block
 
 
-@app.get("/route")
-def get_route(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
-              hour: int = Query(None), mode: str = Query("summer"),
-              compare: bool = Query(True), engine: str = Query("legacy"),
-              K: float = Query(None), dow: int = Query(None),
-              respect_hours: bool = Query(True)):
+@app.get("/routes")
+def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
+               respect_hours: bool = Query(True)):
+    """Distinct walking options between two points, priced at the current hour."""
     t0 = time.time()
     G = S["G"]
-    h = _hour(hour, mode)
-    w = weather.block(h, mode)
+    cond, w, h = conditions_block()
+    dw = hours.now_dow()
     # Opening hours are a hard gate, not a cost: a shut arcade is an absent edge. Applied
-    # to the shade route AND its shortest-path baseline, so the two stay comparable.
-    dw = hours.now_dow() if dow is None else int(dow)
+    # identically to every option so the comparison between them stays attributable.
     closed = hours.closed_keys(h, dw) if respect_hours else set()
+
     s, ds = nearest(from_lat, from_lon, 300.0)
     t, dt = nearest(to_lat, to_lon, 300.0)
     if s is None or t is None:
         raise HTTPException(400, f"point off the pedestrian network "
-                                 f"(start {ds:.0f}m, end {dt:.0f}m from nearest node)")
-    use_utci = str(engine).lower() in ("utci", "v2", "physical")
-    solved = None
-    if use_utci:
-        from . import engine as _e
-        from .cost import K_DEFAULT
-        st = _engine_state(mode)
-        # solve() depends only on (hour, weather), never on origin/destination -> cache it,
-        # and only re-stash onto the graph when the applied hour actually changes.
-        solved = st["solved"].get(h)
-        if solved is None:
-            solved = _e.solve(st["E"], w, st["wx"], h)
-            st["solved"][h] = solved
-        if st["applied"] != h:
-            _e.apply(G, st["E"], solved)
-            st["applied"] = h
+                                 f"(start {ds:.0f} m, end {dt:.0f} m from nearest node)")
+    apply_hour(h, w)
+
+    # Walk the K ladder. solve() is cached per hour, so each extra K is one more A* over
+    # a graph that is already warm -- a few ms, not a few seconds.
+    seen, opts, baseline = {}, [], None
+    for K in K_LADDER:
         try:
             r = routing.route_utci(G, s, t, K, closed)
         except routing.RouteError as e:
             raise HTTPException(422, str(e))
-    else:
-        weights = {"w_heat": w["w_heat"], "w_wet": w["w_wet"],
-                   "direct_radiation": w["direct_radiation"]}
-        try:
-            r = routing.route(G, s, t, h, weights, closed)
-        except routing.RouteError as e:
-            raise HTTPException(422, str(e))
-    direct = w["direct_radiation"]
+        if baseline is None:
+            baseline = describe(G, r["shortest"], h, w)
+        key = tuple(r["path"])
+        if key in seen:
+            # Same walk as a lower K already produced. Record that this K reached it and
+            # move on -- collapsing it is the honest answer, not padding the list.
+            seen[key]["K_reached"].append(K)
+            continue
+        summ = describe(G, r["path"], h, w)
+        avoided = compare_thermal(summ, baseline)
+        avoided["extra_m"] = round(summ["distance_m"] - baseline["distance_m"], 1)
+        avoided["extra_s"] = round(avoided["extra_m"] / 1.35, 1)
+        # Secondary to the dose, and outdoor-only on both sides: an air-conditioned
+        # arcade must not drag a mean down and read as free comfort.
+        a, b = summ.get("utci_mean_outdoor"), baseline.get("utci_mean_outdoor")
+        avoided["utci_outdoor_delta"] = round(b - a, 2) if (a is not None and b is not None) else None
+        opt = {
+            "id": f"k{int(K * 100):03d}",
+            "K": K,
+            "K_effective": r["K_effective"],
+            "K_reached": [K],
+            "is_shortest": list(r["path"]) == list(r["shortest"]),
+            "detour_ratio": r["ratio"],
+            "detour_capped": r["capped"],
+            "relax_attempts": r["attempts"],
+            "door_m": r["door_m"],
+            "level_jump_m": r["level_jump_m"],
+            "summary": summ,
+            "avoided": avoided,
+            "geometry": {"type": "LineString",
+                         "coordinates": [list(G.nodes[n]["ll"]) for n in r["path"]]},
+            "segments": segments(G, r["path"], h),
+        }
+        seen[key] = opt
+        opts.append(opt)
 
-    def _thermal(path):
-        """Path thermal state. `stress_load` (degC-min) is the headline; the
-        length-weighted means are kept as secondary, with UTCI computed OUTDOOR-ONLY so
-        an air-conditioned arcade cannot drag the average down and read as free comfort.
-        """
-        if not use_utci:
-            return {}
-        es = [G[u][v] for u, v in zip(path, path[1:])]
-        L = np.array([float(e["length"]) for e in es])
-        out = thermal_summary(G, path)
-        if L.sum() > 0:
-            gw = lambda k: float((np.array([e.get(k, np.nan) for e in es]) * L).sum() / L.sum())
-            out.update({"utci_mean": round(gw("_utci"), 2), "mrt_mean": round(gw("_mrt"), 2),
-                        "stress_mean": round(gw("_stress"), 3)})
-        return out
-
-    def pack(path, extra=None):
-        props = {"hour": h, "mode": mode}
-        props.update(extra or {})
-        summ = summarise(G, path, h, direct)
-        summ.update(_thermal(path))
-        return {"geojson": geojson(G, path, props), "summary": summ,
-                "segments": segments(G, path, h)}
-
-    eff = ({"K_effective": r["K_effective"]} if use_utci
-           else {"w_heat_effective": r["w_heat_effective"]})
-    routes = {"shaded": pack(r["path"], dict(eff, detour_ratio=r["ratio"],
-                                             detour_capped=r["capped"])),
-              "shortest": pack(r["shortest"])}
-    # The pitch line: stress avoided, and the seconds it cost. Both routes are summarised
-    # under the SAME applied hour and weather, so the difference is attributable.
-    cmp_ = compare_thermal(routes["shaded"]["summary"], routes["shortest"]["summary"])
-    if cmp_:
-        cmp_["extra_m"] = round(routes["shaded"]["summary"]["distance_m"]
-                                - routes["shortest"]["summary"]["distance_m"], 1)
-        cmp_["extra_s"] = round(cmp_["extra_m"] / 1.35, 1)
-        routes["shaded"]["summary"]["avoided"] = cmp_
-    return {"routes": routes, "weather": w, "hour": h, "avoided": cmp_,
-            "meta": {"snap_m": [round(ds, 1), round(dt, 1)],
-                     "engine": "utci" if use_utci else "legacy",
-                     "w_heat_requested": w["w_heat"],
-                     "w_heat_effective": r.get("w_heat_effective"),
-                     "K_effective": r.get("K_effective"),
-                     # The per-transition prices are reported next to K because they are
-                     # the other half of the same decision, and because the relaxation
-                     # loop sheds K alone: door_m and level_jump_m are what the walker
-                     # pays, not a preference we trade away when a route runs long.
-                     "door_m": r.get("door_m"), "level_jump_m": r.get("level_jump_m"),
-                     "detour_ratio": r["ratio"], "detour_capped": r["capped"],
-                     "relax_attempts": r["attempts"],
-                     "availability": dict(hours.describe(h, dw), enforced=respect_hours),
-                     # Additive, and deliberately on every response: any number taken out
-                     # of this API is only evidence alongside the config that made it.
-                     "provenance": S.get("prov"),
-                     "ms": round((time.time() - t0) * 1000, 1)}}
-
-
-@app.get("/shade/{hour}.png")
-def shade_png(hour: int, mode: str = Query("summer")):
-    """The overlay must come from the SAME raster set the router priced the route on.
-
-    These pngs used to be served straight out of out/, which is the LEGACY set -- flat
-    8 m crowns extruded to the pavement, blocking 0.7 -- while the engine has been
-    costing edges off out/v2/. That put two different shade models on one screen and
-    invited the difference between them to be read as a result. Resolve the directory
-    through engine._shade_path so the picture and the number cannot drift apart.
-    """
-    from . import engine as _e
-    wm = "summer" if mode != "winter" else "winter"
-    cands = [_e._shade_path(hour, _shade_key(wm)).replace(".npy", ".png"),
-             f"{OUT}/shade_{hour:02d}.png", f"{OUT}/shade_{hour}.png"]
-    for p in cands:
-        if os.path.exists(p):
-            return FileResponse(p, media_type="image/png")
-    raise HTTPException(404, f"no shade overlay for hour {hour} yet")
-
-
-@app.get("/provenance")
-def get_provenance(mode: str = Query("summer")):
-    """Which configuration produced the numbers this API is returning.
-
-    Any figure quoted from a screenshot, a demo or a doc should be quotable WITH this,
-    or it is a number against a moving reference. `line` is the compact form meant to
-    sit under a table; the rest is the full stamp.
-    """
-    import provenance as _p
-    # Stamp the set the ROUTER would resolve, not the one the legacy mode table names.
-    # Those diverge the moment a date has its own generated set, and a provenance line
-    # that names the wrong rasters is worse than none.
-    s = _p.stamp(mode=_shade_key("summer" if mode != "winter" else "winter"))
-    return {"line": _p.line(s), **s}
-
-
-@app.get("/shade/bounds.json")
-def shade_bounds():
-    p = f"{OUT}/shade_bounds.json"
-    if os.path.exists(p):
-        return json.load(open(p))
-    raise HTTPException(404, "out/shade_bounds.json not generated yet")
-
-
-os.makedirs(OUT, exist_ok=True)
-app.mount("/static", StaticFiles(directory=OUT), name="static")
-
-if os.path.isdir(WEB) and os.path.exists(f"{WEB}/index.html"):
-    app.mount("/", StaticFiles(directory=WEB, html=True), name="web")
-else:
-    @app.get("/")
-    def root():
-        return JSONResponse({"ok": True, "app": "ShadeMe",
-                             "note": "web/index.html not present yet",
-                             "endpoints": ["/health", "/places", "/weather", "/route",
-                                           "/shade/{hour}.png", "/static/..."]})
+    # Drop dominated options: a walk that is BOTH slower and hotter than another one on
+    # the list is not a choice, it is noise. This is not cosmetic -- the mid-ladder K
+    # values genuinely produce such routes here, because route_utci short-circuits at
+    # K <= 0 and hands back the plain shortest path WITHOUT charging its door crossings,
+    # while every K > 0 search pays DOOR_PENALTY_M per door. Where the shortest path
+    # happens to run through an arcade, the baseline gets that arcade for free and the
+    # K > 0 searches are pushed out of it, landing hotter than the thing they are
+    # supposed to improve on. The count is reported rather than swallowed.
+    kept = [o for o in opts if not any(
+        other is not o
+        and other["summary"]["minutes"] <= o["summary"]["minutes"]
+        and other["summary"].get("stress_load", 0.0) <= o["summary"].get("stress_load", 0.0)
+        and (other["summary"]["minutes"] < o["summary"]["minutes"]
+             or other["summary"].get("stress_load", 0.0) < o["summary"].get("stress_load", 0.0))
+        for other in opts)]
+    dominated = len(opts) - len(kept)
+    opts = kept
+    # Coolest = least thermal dose, not least mean temperature. Ties break on time.
+    opts.sort(key=lambda o: (o["summary"].get("stress_load", 0.0), o["summary"]["minutes"]))
+    # Collapse near-duplicates. Two walks that differ by six seconds and half a degC-min
+    # are the same walk to the person doing it, and offering both as cards makes the
+    # list look precise rather than useful. The survivor is the cooler one -- the list is
+    # already sorted that way -- and it absorbs the other's K so nothing is lost.
+    merged, near = [], 0
+    for o in opts:
+        twin = next((m for m in merged
+                     if abs(m["summary"]["minutes"] - o["summary"]["minutes"]) <= SAME_WALK_MIN
+                     and abs(m["summary"].get("stress_load", 0.0)
+                             - o["summary"].get("stress_load", 0.0)) <= SAME_WALK_DOSE), None)
+        if twin:
+            twin["K_reached"].extend(o["K_reached"])
+            near += 1
+        else:
+            merged.append(o)
+    opts = merged
+    coolest_id = opts[0]["id"]
+    shortest_id = next((o["id"] for o in opts if o["is_shortest"]), None)
+    for o in opts:
+        o["label"] = label_for(o, coolest_id, shortest_id)
+    # One option means there is no cooler way to go right now. Say it plainly rather
+    # than manufacturing a second card.
+    return {
+        "conditions": cond,
+        "options": opts,
+        "meta": {
+            "snap_m": [round(ds, 1), round(dt, 1)],
+            "hour": h,
+            "as_of": cond["as_of"],
+            "k_ladder": list(K_LADDER),
+            "distinct_paths": len(opts),
+            "dominated_dropped": dominated,
+            "near_duplicates_merged": near,
+            "availability": dict(hours.describe(h, dw), enforced=respect_hours),
+            "detour_cap": routing.DETOUR_CAP,
+            # Additive and deliberately on every response: any number taken out of this
+            # API is only evidence alongside the config that made it.
+            "provenance": S.get("prov"),
+            "ms": round((time.time() - t0) * 1000, 1),
+        },
+    }
