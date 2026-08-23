@@ -1,7 +1,7 @@
 import './global.css';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, Text, useWindowDimensions, View } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -20,6 +20,17 @@ import { RouteMap } from './src/components/RouteMap';
 /** Conditions are re-read on this cadence. The engine prices the wall clock, so the
  * chips have to keep up with it without the user doing anything. */
 const CONDITIONS_MS = 5 * 60 * 1000;
+
+/** Sheet detents, as fractions of window height. Kept as numbers rather than the
+ * percentage strings BottomSheet wants, so the map can work out how much of itself is
+ * actually visible; the strings are derived from these rather than maintained beside
+ * them. */
+const DETENTS = [0.22, 0.52, 0.9];
+
+/** However far the sheet is pulled up, the map keeps this much of itself to fit a route
+ * into. Without the cap, fitBounds at the 90% detent is asked to draw a route into a
+ * sliver and zooms out until it is meaningless. */
+const MAX_SHEET_FRACTION = 0.55;
 
 function EndpointRow({
   icon,
@@ -65,9 +76,15 @@ function Laneway() {
   const [picking, setPicking] = useState<'from' | 'to' | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [sheetHeight, setSheetHeight] = useState(320);
+  const [detent, setDetent] = useState(1);
 
-  const snapPoints = useMemo(() => ['22%', '52%', '90%'], []);
+  const { height: windowHeight } = useWindowDimensions();
+  const snapPoints = useMemo(() => DETENTS.map((d) => `${d * 100}%`), []);
+  // Derived from the detent, NOT measured from the scroll content: onLayout there
+  // reports how tall the content is, which is unrelated to how much map the sheet
+  // is covering once the content scrolls.
+  const sheetHeight =
+    windowHeight * Math.min(DETENTS[detent] ?? DETENTS[1], MAX_SHEET_FRACTION);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -149,13 +166,12 @@ function Laneway() {
         ref={sheet}
         index={1}
         snapPoints={snapPoints}
-        onChange={() => {}}
+        onChange={setDetent}
         backgroundStyle={{ backgroundColor: theme.paper }}
         handleIndicatorStyle={{ backgroundColor: theme.line }}
       >
         <BottomSheetScrollView
           contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: insets.bottom + 24 }}
-          onLayout={(e) => setSheetHeight(e.nativeEvent.layout.height)}
         >
           <Text className="mb-2 text-[22px] font-semibold text-ink dark:text-paper">
             Directions

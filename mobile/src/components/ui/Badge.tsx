@@ -1,5 +1,4 @@
-import { View } from 'react-native';
-import { Text } from 'react-native';
+import { Text, View } from 'react-native';
 import { cn } from '../../lib/cn';
 
 type Tone = 'neutral' | 'sun' | 'shade' | 'indoor';

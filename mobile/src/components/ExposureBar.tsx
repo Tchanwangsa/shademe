@@ -19,6 +19,9 @@ export function ExposureBar({ option }: { option: RouteOption }) {
     shade: theme.shade,
     indoor: theme.indoor,
   };
+  // The dark palette lightens these bands, so a white label on them fails contrast.
+  // The label tracks the band, not the theme's foreground.
+  const label = theme.isDark ? '#141613' : '#FFFFFF';
 
   return (
     <View>
@@ -32,7 +35,11 @@ export function ExposureBar({ option }: { option: RouteOption }) {
               style={{ flex: share, backgroundColor: color[s.exposure] }}
             >
               {share > 0.14 ? (
-                <Text className="text-[11px] font-medium text-white" numberOfLines={1}>
+                <Text
+                  className="text-[11px] font-medium"
+                  style={{ color: label }}
+                  numberOfLines={1}
+                >
                   {LABEL[s.exposure]}
                 </Text>
               ) : null}
