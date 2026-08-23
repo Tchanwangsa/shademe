@@ -330,8 +330,17 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
     s, ds = nearest(from_lat, from_lon, 300.0)
     t, dt = nearest(to_lat, to_lon, 300.0)
     if s is None or t is None:
-        raise HTTPException(400, f"point off the pedestrian network "
-                                 f"(start {ds:.0f} m, end {dt:.0f} m from nearest node)")
+        # Name the end that is off, and say it in a unit a person reads. This is the
+        # error a real user hits most -- standing outside the CBD, or a simulator
+        # defaulting to Cupertino -- so "start 15986795 m from nearest node" is the
+        # wrong thing to put in front of them. The metres stay, in the parenthesis.
+        which = "Both ends are" if (s is None and t is None) else \
+                ("The starting point is" if s is None else "The destination is")
+        far = max(d for d, n in ((ds, s), (dt, t)) if n is None)
+        away = f"{far / 1000:.0f} km" if far >= 1000 else f"{far:.0f} m"
+        raise HTTPException(400, f"{which} outside the area Laneway covers. "
+                                 f"It only knows the Melbourne CBD, and this is "
+                                 f"{away} from the nearest walkable street.")
     st = apply_hour(h, w)
 
     # Walk the K ladder. solve() is cached per hour, so each extra K is one more A* over
@@ -341,7 +350,12 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
         try:
             r = routing.route_utci(G, s, t, K, closed)
         except routing.RouteError as e:
-            raise HTTPException(422, str(e))
+            # Same treatment as the off-network case above: the graph's vocabulary is not
+            # the user's. "Snap to the same node" means the two pins landed on one corner.
+            msg = ("Those two points are close enough to be the same spot — "
+                   "they land on the same street corner."
+                   if "same graph node" in str(e) else str(e))
+            raise HTTPException(422, msg)
         if baseline is None:
             baseline = describe(G, r["shortest"], h, w)
         key = tuple(r["path"])
