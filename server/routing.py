@@ -1,8 +1,8 @@
 """A* over the pedestrian graph, with a 1.4x detour cap."""
 import math, heapq, itertools
 import networkx as nx
-from .cost import (edge_cost, utci_cost, K_DEFAULT, DOOR_PENALTY_M, LEVEL_JUMP_M,
-                   door_state)
+from .cost import (edge_cost, utci_cost, uv_cost, K_DEFAULT, K_UV_DEFAULT,
+                   DOOR_PENALTY_M, LEVEL_JUMP_M, door_state)
 
 DETOUR_CAP = 1.4
 MAX_RELAX = 4          # halvings of w_heat before we give up and use the shortest path
@@ -131,20 +131,20 @@ def shortest(G, s, t, closed=None):
     return _astar(G, s, t, gate(closed)(lambda u, v, d: float(d["length"])))
 
 
-def route_utci(G, s, t, K=None, closed=None, door=None, level_jump=None):
-    """A* under the physical UTCI cost. Relaxes K (not six weights) to honour the cap.
+def _route_pref(G, s, t, K, weight, closed=None, door=None, level_jump=None):
+    """A* under a preference of the form `length * (1 + K * <badness>)`. Relaxes K only.
 
-    Requires server.engine.apply() to have stashed `_stress` on the edges first.
-    `closed` gates shut arcades out of BOTH this route and its shortest-path baseline --
-    comparing a route that respects opening hours against one that walks through a locked
-    building would attribute the difference to the shade model.
+    Shared by route_utci and route_uv so the two objectives cannot drift apart in the
+    parts that are not about the objective: the shortest-path baseline, the detour cap,
+    the relaxation loop, the K <= 0 short-circuit and the door/climb accounting are one
+    implementation, and `weight` is the only thing that differs.
 
     THE RELAXATION LOOP SHEDS K ONLY. When a route breaks the detour cap we halve the
-    thermal preference and try again, but the door penalty and the imputed storey climb
-    are held fixed: those are costs the walker really pays, not a preference we are
-    willing to trade away because the walk turned out long. Shedding them under pressure
-    would mean the longer the detour, the more freely we send someone through a building
-    -- exactly backwards.
+    preference and try again, but the door penalty and the imputed storey climb are held
+    fixed: those are costs the walker really pays, not a preference we are willing to
+    trade away because the walk turned out long. Shedding them under pressure would mean
+    the longer the detour, the more freely we send someone through a building -- exactly
+    backwards.
 
     The cap itself stays denominated in PLAN length. It answers "how much further are we
     sending you", and a staircase does not send you further; the climb is priced inside
@@ -156,7 +156,7 @@ def route_utci(G, s, t, K=None, closed=None, door=None, level_jump=None):
     base = path_length(G, sp)
     door = DOOR_PENALTY_M if door is None else float(door)
     level_jump = LEVEL_JUMP_M if level_jump is None else float(level_jump)
-    K = K_DEFAULT if K is None else float(K)
+    K = float(K)
     if K <= 0:
         # K = 0 means "give me the shortest route", so it returns exactly that -- and the
         # reported door/climb are 0.0 because this path was not charged them. Running the
@@ -168,7 +168,7 @@ def route_utci(G, s, t, K=None, closed=None, door=None, level_jump=None):
                 "door_m": 0.0, "level_jump_m": 0.0}
     best, ratio, i = sp, 1.0, 0
     for i in range(MAX_RELAX + 1):
-        p = _astar_state(G, s, t, lambda d: utci_cost(d, K), door, level_jump, closed)
+        p = _astar_state(G, s, t, lambda d: weight(d, K), door, level_jump, closed)
         ratio = (path_length(G, p) / base) if base > 0 else 1.0
         if ratio <= DETOUR_CAP:
             best = p
@@ -180,6 +180,30 @@ def route_utci(G, s, t, K=None, closed=None, door=None, level_jump=None):
     return {"path": best, "shortest": sp, "K_effective": round(K, 4), "attempts": i,
             "capped": i > 0, "ratio": round(ratio, 3), "base_m": round(base, 1),
             "door_m": round(door, 1), "level_jump_m": round(level_jump, 1)}
+
+
+def route_utci(G, s, t, K=None, closed=None, door=None, level_jump=None):
+    """A* under the physical UTCI cost. Relaxes K (not six weights) to honour the cap.
+
+    Requires server.engine.apply() to have stashed `_stress` on the edges first.
+    `closed` gates shut arcades out of BOTH this route and its shortest-path baseline --
+    comparing a route that respects opening hours against one that walks through a locked
+    building would attribute the difference to the shade model.
+    """
+    return _route_pref(G, s, t, K_DEFAULT if K is None else K, utci_cost,
+                       closed, door, level_jump)
+
+
+def route_uv(G, s, t, K=None, closed=None, door=None, level_jump=None):
+    """A* under the UV cost. Requires engine.apply() to have stashed `_uv_frac`.
+
+    A DIFFERENT OBJECTIVE, not a differently-tuned one -- see cost.uv_cost. It shares
+    every constraint with route_utci (same cap, same doors, same closures) so the two
+    results are comparable, and that is the point: where they return the same path there
+    is nothing to choose, and where they diverge the divergence is real.
+    """
+    return _route_pref(G, s, t, K_UV_DEFAULT if K is None else K, uv_cost,
+                       closed, door, level_jump)
 
 
 def route(G, s, t, hour, weights, closed=None):

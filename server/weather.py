@@ -1,29 +1,50 @@
 """Open-Meteo weather -> cost weights. No API key. Disk-cached so the demo survives dead wifi."""
 import os, json, time, requests
 
+from . import uv as UV
+
 LAT, LON = -37.8136, 144.9631
 TZ = "Australia/Melbourne"
-# Hero demo day. 26 Jan 2026 flips its own advice across the hour slider. Apparent
-# temperature under the default correction (`season-shape[DJF]+level`), raw feed in
-# brackets:
-#   09:00  20.2 C (20.0), half-diffuse -> W_heat 0.02, effectively no heat preference
-#   14:00  31.9 C (32.0), clear        -> W_heat 2.11, the detour hour
-#   18:00  31.7 C (30.5), low sun already shades the direct route
-# Override the day with SHADEME_SUMMER_DATE=YYYY-MM-DD.
-# NO ROUTE FIGURES HERE ON PURPOSE. Route distances and UTCI deltas depend on the graph,
-# which is being rebuilt by the opening-hours work, and a figure pinned in a comment is a
-# figure that goes stale silently. Re-measure and quote with a provenance stamp instead --
-# scripts/provenance.py, and see the Provenance section of ENGINE_CONTRACT.md.
-# Hotter alternatives, both live in the archive: 2026-01-24 (35.9C), 2026-01-27 (42.8C).
-SUMMER_DATE = os.environ.get("SHADEME_SUMMER_DATE", "2026-01-26")
+
+# THIS MODULE SERVES TODAY. There is no summer mode and no winter mode: `mode` used to
+# name a season, the season chose a demo day, and the live API had to reach in and
+# reassign the constant at import to stop itself pricing an August walk on January
+# weather. A date is the only thing any caller actually meant, so a date is what the
+# functions take -- `get()` / `block()` accept "YYYY-MM-DD", or None for today.
+#
+# Only scripts/ still want a fixed day, so that benchmarks reproduce; they get it by
+# passing one explicitly, or by setting SHADEME_DATE. Nothing pins itself by default.
+# Hotter archive days worth naming: 2026-01-26 (32 C), 2026-01-24 (35.9), 2026-01-27 (42.8).
+PINNED_DATE = os.environ.get("SHADEME_DATE") or os.environ.get("SHADEME_SUMMER_DATE")
+
+# Legacy season names, for the two bench scripts that still pass one. They resolve to a
+# date like everything else; they are not a second code path.
+LEGACY_DAYS = {"summer": "2026-01-26", "winter": None, "cold": None}
+
+
+def today():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+
+def resolve_day(day=None):
+    """Whatever a caller passed -> a YYYY-MM-DD string. None/'' means today."""
+    if day in LEGACY_DAYS:
+        day = LEGACY_DAYS[day]
+    return str(day) if day else (PINNED_DATE or today())
+
+
+# uv_index_clear_sky rides along because Open-Meteo returns it EQUAL to `uv_index` for
+# this cell at every hour of the day, cloud cover included -- so `uv_index` is not the
+# all-sky value its name promises. server/uv.py attenuates it. Both are carried so the
+# day the feed starts distinguishing them, the difference is visible rather than assumed.
 VARS = ["temperature_2m", "apparent_temperature", "direct_radiation", "diffuse_radiation",
-        "cloud_cover", "precipitation", "wind_speed_10m", "uv_index",
+        "cloud_cover", "precipitation", "wind_speed_10m", "uv_index", "uv_index_clear_sky",
         "relative_humidity_2m"]   # humidity: needed by MRT longwave + UTCI, added in the v2 engine
 # Open-Meteo defaults wind to km/h. That default was previously implicit, which is a trap:
 # UTCI and the convective term both want m/s. Pin the unit explicitly and expose BOTH,
 # so the legacy W_wet (tuned on km/h) and the physics (m/s) can never diverge silently.
 WIND_UNIT = "kmh"
-CACHE_V = 2                          # bump when VARS changes so old caches are refetched
+CACHE_V = 3                          # bump when VARS changes so old caches are refetched
 TTL = 600                            # re-fetch only if cache older than 10 min
 DATA = os.path.join(os.path.dirname(__file__), "..", "data")
 ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
@@ -85,6 +106,7 @@ _TABLE = {
     "wind_speed_10m":      [14.2,13.2,12.0,11.9,11.2,10.9,12.0,13.9,14.2,13.2,12.5,13.5,
                             14.4,15.7,17.1,18.6,17.2,16.9,15.8,13.0,12.2,13.8,13.0,11.3],
     "uv_index":            [None]*24,
+    "uv_index_clear_sky":  [None]*24,
     # observed 2026-01-14 Melbourne RH%, paired with the temps above
     "relative_humidity_2m":[71,72,74,75,74,75,75,73,69,63,59,55,
                             51,48,47,46,44,45,49,55,58,62,64,67],
@@ -100,6 +122,7 @@ _WINTER_TABLE = {                    # generic cold+wet Melbourne day, only if o
     "precipitation":       [0.2]*24,
     "wind_speed_10m":      [18.0]*24,
     "uv_index":            [0,0,0,0,0,0,0,0.3,1.0,1.5,2.0,2.5,3.0,3.0,2.5,2.0,1.2,0.4,0,0,0,0,0,0],
+    "uv_index_clear_sky":  [0,0,0,0,0,0,0,0.3,1.0,1.5,2.0,2.5,3.0,3.0,2.5,2.0,1.2,0.4,0,0,0,0,0,0],
     "relative_humidity_2m":[88]*7 + [86,84,80,76,72,70,68,68,70,74,78,82,85] + [87]*4,
 }
 
@@ -109,7 +132,7 @@ _mem = {}
 def clamp(lo, hi, v): return max(lo, min(hi, v))
 
 
-def _cache_path(mode): return os.path.abspath(os.path.join(DATA, f"weather_cache_{mode}.json"))
+def _cache_path(day): return os.path.abspath(os.path.join(DATA, f"weather_cache_{day}.json"))
 
 
 def _by_hour(hourly):
@@ -132,66 +155,98 @@ def _get(url, params):
     return r.json()
 
 
-def _fetch(mode):
-    """Returns (payload, source). Raises only if every route fails."""
+def _days_ago(day):
+    """Whole days between `day` and today, or None if it will not parse."""
+    try:
+        t = time.mktime(time.strptime(str(day), "%Y-%m-%d"))
+        return int((time.time() - t) // 86400)
+    except (ValueError, TypeError):
+        return None
+
+
+def _fetch(day):
+    """Returns (payload, source) for one YYYY-MM-DD. Raises only if every route fails.
+
+    FORECAST FIRST, ARCHIVE SECOND, and that order is the fix for a real bug rather than
+    a preference. The archive endpoint answers for today -- it does not "miss and fall
+    through" the way the API layer used to assume -- and it returns the same temperature,
+    cloud and radiation as the forecast endpoint but with **uv_index absent**. Absent UV
+    was then filled in by an estimate off broadband radiation, which read UV 6 in
+    Melbourne in late August against 3.6 measured. So the endpoint that actually carries
+    the field is asked first, and the archive is the fallback for old dates it alone has.
+    """
     hourly = ",".join(VARS)
-    if mode == "summer":
+    f = (FORECAST, dict(latitude=LAT, longitude=LON, start_date=day, end_date=day,
+                        hourly=hourly, timezone=TZ), f"open-meteo forecast {day}")
+    a = (ARCHIVE, dict(latitude=LAT, longitude=LON, start_date=day, end_date=day,
+                       hourly=hourly, timezone=TZ), f"open-meteo archive {day}")
+    # The forecast endpoint serves ~92 days back and refuses older dates with a 400.
+    # Asking it anyway and letting it fail works, but it prints an alarming traceback on
+    # every start-up of a pinned demo day, so ask the one that can answer first.
+    tries = [f, a] if (_days_ago(day) or 0) <= 90 else [a, f]
+    err = None
+    for url, params, label in tries:
         try:
-            j = _get(ARCHIVE, dict(latitude=LAT, longitude=LON, start_date=SUMMER_DATE,
-                                   end_date=SUMMER_DATE, hourly=hourly, timezone=TZ))
+            j = _get(url, params)
             hrs = _by_hour(j["hourly"])
-            if any(hrs[h]["direct_radiation"] for h in hrs):
-                return {"hours": hrs, "date": SUMMER_DATE}, f"open-meteo archive {SUMMER_DATE}"
+            if hrs and any(hrs[h].get("direct_radiation") is not None for h in hrs):
+                return {"hours": hrs, "date": day}, label
         except Exception as e:
-            print(f"[weather] archive failed: {e}")
-        try:                                   # forecast API can serve recent past dates
-            j = _get(FORECAST, dict(latitude=LAT, longitude=LON, start_date=SUMMER_DATE,
-                                    end_date=SUMMER_DATE, hourly=hourly, timezone=TZ))
-            hrs = _by_hour(j["hourly"])
-            if any(hrs[h]["direct_radiation"] for h in hrs):
-                return {"hours": hrs, "date": SUMMER_DATE}, f"open-meteo forecast-past {SUMMER_DATE}"
-        except Exception as e:
-            print(f"[weather] forecast-past failed: {e}")
-        raise RuntimeError("no live summer data")
-    j = _get(FORECAST, dict(latitude=LAT, longitude=LON, hourly=hourly, timezone=TZ,
-                            forecast_days=1))
-    date = j["hourly"]["time"][0][:10]
-    return {"hours": _by_hour(j["hourly"]), "date": date}, f"open-meteo forecast {date}"
+            err = e
+            print(f"[weather] {label} failed: {e}")
+    raise RuntimeError(f"no data for {day} ({err})")
 
 
-def get(mode="summer"):
-    """Cached hourly payload for a mode. {'hours':{h:{...}}, 'date':..., 'source':...}"""
-    mode = "summer" if mode == "summer" else "winter"
+def _fallback_table(day):
+    """The offline table that fits this DAY, chosen by its month rather than by a mode.
+
+    Used only when there is no network AND no cache, so it is a last resort in every
+    sense; picking it by month is simply the one thing available that is not a guess.
+    Southern-hemisphere warm season is Nov-Mar.
+    """
+    try:
+        month = int(str(day)[5:7])
+    except (ValueError, IndexError):
+        month = time.localtime().tm_mon
+    return _TABLE if month in (11, 12, 1, 2, 3) else _WINTER_TABLE
+
+
+def get(day=None):
+    """Cached hourly payload for one day. {'hours':{h:{...}}, 'date':..., 'source':...}
+
+    `day` is a YYYY-MM-DD string, or None for today. A legacy season name still resolves
+    (see LEGACY_DAYS) so the bench scripts keep running, but it is turned into a date
+    here and nothing downstream sees a mode.
+    """
+    day = resolve_day(day)
     now = time.time()
-    c = _mem.get(mode)
+    c = _mem.get(day)
     if c is None:
         try:
-            c = json.load(open(_cache_path(mode)))
+            c = json.load(open(_cache_path(day)))
             c["hours"] = {int(k): v for k, v in c["hours"].items()}
-            _mem[mode] = c
+            _mem[day] = c
         except Exception:
             c = None
-    fresh = c and now - c.get("ts", 0) < TTL and c.get("cache_v") == CACHE_V
-    if mode == "summer" and c and c.get("date") != SUMMER_DATE:
-        fresh = False                           # demo day changed under us
-    if fresh:
+    if c and c.get("date") != day:
+        c = None                                # cache file is for some other day
+    if c and now - c.get("ts", 0) < TTL and c.get("cache_v") == CACHE_V:
         return c
     try:
-        payload, source = _fetch(mode)
+        payload, source = _fetch(day)
         payload.update(ts=now, source=source, cache_v=CACHE_V)
         os.makedirs(os.path.abspath(DATA), exist_ok=True)
-        json.dump(payload, open(_cache_path(mode), "w"))
-        _mem[mode] = payload
+        json.dump(payload, open(_cache_path(day), "w"))
+        _mem[day] = payload
         return payload
     except Exception as e:
         print(f"[weather] fetch failed ({e})")
         if c:                                   # stale cache beats a lie
             c["source"] = c.get("source", "cache") + " (stale cache, offline)"
             return c
-        tbl = _TABLE if mode == "summer" else _WINTER_TABLE
-        p = _table(tbl, SUMMER_DATE if mode == "summer" else "today")
+        p = _table(_fallback_table(day), day)
         p.update(ts=now, source="fallback-table (hardcoded, offline - NOT live)")
-        _mem[mode] = p
+        _mem[day] = p
         return p
 
 
@@ -319,9 +374,34 @@ def apply_bias(p):
     return q
 
 
-def block(hour, mode="summer"):
-    """The contract `weather` block for one hour."""
-    p = apply_bias(get(mode))
+def solar_elevation(day, hour):
+    """Solar elevation in degrees, or None if the astronomy helper is not importable.
+
+    Only the archive path needs it (server/uv.clear_sky), so an ImportError here must
+    degrade to "no UV" rather than take the weather block down with it.
+    """
+    try:
+        import sys
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
+        import pandas as pd
+        from shadow import sun_position
+        return float(sun_position(pd.Timestamp(f"{day} {int(hour):02d}:00", tz=TZ))[1])
+    except Exception:
+        return None
+
+
+def block(hour, day=None, now_hour=None, wet=False):
+    """The contract `weather` block for one hour of one day.
+
+    `now_hour` is the wall-clock hour, and it is what lets the UV index be a MEASUREMENT
+    rather than a model: the live ARPANSA reading can only answer for right now, so it is
+    used when `hour` is that hour and the modelled value is used otherwise. Passing None
+    means "do not claim anything is live" and gives the modelled branch throughout.
+
+    `wet` restores the legacy precipitation/wind weight, which only the old `edge_cost`
+    path reads. The v2 engine does not use w_heat or w_wet at all.
+    """
+    p = apply_bias(get(day))
     hrs = p["hours"]
     h = int(hour) if int(hour) in hrs else min(hrs, key=lambda k: abs(k - int(hour)))
     r = hrs[h]
@@ -346,19 +426,29 @@ def block(hour, mode="summer"):
     wind_ms = wind / 3.6                       # WIND_UNIT is pinned to km/h upstream
     w_heat = clamp(0.0, 3.0, (app - 20.0) / 5.0) * direct_fraction
     w_wet = clamp(0.0, 3.0, precip * 2.0 + wind / 15.0)
-    uv = r.get("uv_index")
-    uv = round(tot / 100.0, 1) if uv is None else round(float(uv), 1)   # estimate if absent
-    if mode == "shortest":
-        w_heat = w_wet = 0.0
-    elif mode != "winter":
-        w_wet = 0.0                              # W_wet is a winter-mode weight
+    # UV IS NEVER ESTIMATED FROM RADIATION. See server/uv.py -- the previous
+    # `(direct + diffuse) / 100` fallback read UV 6 against 3.6 measured. If neither the
+    # live network nor the feed can answer, this is None and the client shows nothing.
+    uv_feed = r.get("uv_index")
+    if uv_feed is None:
+        uv_feed = r.get("uv_index_clear_sky")
+    cloud = _f(r.get("cloud_cover"))
+    uv, uv_source = UV.index_for(h, now_hour if now_hour is not None else -1,
+                                 None if uv_feed is None else float(uv_feed), cloud,
+                                 elev_deg=solar_elevation(p.get("date"), h))
+    if not wet:
+        w_wet = 0.0                              # legacy weight; off unless asked for
     return {
+        "date": p.get("date"),
+        "hour": h,
         "temperature": round(temp, 1),
         "apparent_temperature": round(app, 1),
         "direct_radiation": round(direct, 1),
         "diffuse_radiation": round(diffuse, 1),
-        "cloud_cover": round(_f(r["cloud_cover"]), 1),
+        "cloud_cover": round(cloud, 1),
         "uv_index": uv,
+        "uv_index_feed": None if uv_feed is None else round(float(uv_feed), 1),
+        "uv_source": uv_source,
         "precipitation": round(precip, 2),
         "wind_speed": round(wind, 1),                    # km/h, legacy field, do not repurpose
         "wind_speed_ms": round(wind_ms, 2),              # m/s at 10 m -- use this for physics

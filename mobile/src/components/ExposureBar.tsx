@@ -47,9 +47,7 @@ export function ExposureBar({ option }: { option: RouteOption }) {
           );
         })}
       </View>
-      <Text className="mt-1.5 text-xs text-ink-soft">
-        Exposure along the walk, start to finish
-      </Text>
+      <Text className="mt-1.5 text-xs text-ink-soft">start → finish</Text>
     </View>
   );
 }

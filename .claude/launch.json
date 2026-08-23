@@ -2,7 +2,7 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "laneway-api",
+      "name": "shademe-api",
       "runtimeExecutable": "/Users/tanatchanwangsa/Documents/melbournehack26/.venv/bin/uvicorn",
       "runtimeArgs": [
         "server.main:app",

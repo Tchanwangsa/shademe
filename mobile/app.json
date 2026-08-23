@@ -1,8 +1,8 @@
 {
   "expo": {
-    "name": "Laneway",
-    "slug": "laneway",
-    "scheme": "laneway",
+    "name": "ShadeMe",
+    "slug": "shademe",
+    "scheme": "shademe",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -10,14 +10,14 @@
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "au.laneway.app",
+      "bundleIdentifier": "au.shademe.app",
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Laneway uses your location to start walking directions from where you are.",
+        "NSLocationWhenInUseUsageDescription": "ShadeMe uses your location to start walking directions from where you are.",
         "ITSAppUsesNonExemptEncryption": false
       }
     },
     "android": {
-      "package": "au.laneway.app",
+      "package": "au.shademe.app",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -36,7 +36,7 @@
       [
         "expo-location",
         {
-          "locationWhenInUsePermission": "Laneway uses your location to start walking directions from where you are."
+          "locationWhenInUsePermission": "ShadeMe uses your location to start walking directions from where you are."
         }
       ]
     ]

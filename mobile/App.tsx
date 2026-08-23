@@ -62,7 +62,7 @@ function EndpointRow({
   );
 }
 
-function Laneway() {
+function ShadeMe() {
   const theme = useTheme();
   const insets = useSafeAreaInsets();
   const sheet = useRef<BottomSheet>(null);
@@ -198,9 +198,7 @@ function Laneway() {
           {loading ? (
             <View className="items-center py-8">
               <ActivityIndicator color={theme.shade} />
-              <Text className="mt-2 text-[13px] text-ink-soft">
-                Pricing the walk at {conditions ? `${conditions.hour}:00` : 'now'}
-              </Text>
+              <Text className="mt-2 text-[13px] text-ink-soft">Finding your options</Text>
             </View>
           ) : null}
 
@@ -235,13 +233,6 @@ function Laneway() {
               </View>
             ))}
           </View>
-
-          {routes && options.length === 1 ? (
-            <Text className="mt-3 text-[12px] leading-5 text-ink-soft">
-              One option: every thermal preference the engine tried came back with the same
-              walk.
-            </Text>
-          ) : null}
         </BottomSheetScrollView>
       </BottomSheet>
 
@@ -267,7 +258,7 @@ export default function App() {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <SafeAreaProvider>
-        <Laneway />
+        <ShadeMe />
       </SafeAreaProvider>
     </GestureHandlerRootView>
   );

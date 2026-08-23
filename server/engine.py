@@ -18,6 +18,8 @@ import mrt as MRT
 from shadow import sun_position
 import pandas as pd
 
+from . import uv as UV
+
 OUT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "out"))
 SCRIPTS = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
 PHYSICS_SRC = ("surface_temp.py", "mrt.py", "shadow.py")
@@ -419,9 +421,28 @@ def solve(E, wx_block, wx_full, hour, K=None, g=None):
     u, clamped = MRT.utci(ta_e, tmrt, np.maximum(va_e, 0.5), vp_hpa=vp_e)
     s = MRT.stress(u)
     mult = 1.0 + K * s
+
+    # --- UV exposure, an INDEPENDENT objective ---------------------------------
+    # Deliberately not derived from `stress`, `mrt` or `mult`. UV has no air-temperature
+    # term, no surface-temperature memory and no wind term, so the two fields disagree
+    # about the same street all the time: a cold, still, cloudless winter laneway scores
+    # zero thermal stress and still carries most of the day's UV. That disagreement is
+    # the whole reason a separate route option is worth offering.
+    #
+    # The other half is SVF. Thermal shade is mostly about the beam; UV is roughly half
+    # skylight even under a clear sky, so a spot that is fully shaded but stands under
+    # open sky still receives ~half the index. `uv_frac` is what carries that, and it is
+    # why the UV route prefers a narrow arcade-side footpath where the thermal route is
+    # happy with any patch of shadow.
+    i_tot = i_dir + i_dif
+    direct_fraction = (i_dir / i_tot) if i_tot > 0 else 0.0
+    uv_frac = np.clip(UV.exposure(shade, svf, direct_fraction), 0.0, 1.0)
+    uv_frac = np.where(prot, 0.0, uv_frac)      # no beam and no sky under a roof
+
     return {"mrt": tmrt, "utci": u, "stress": s, "mult": mult, "shade": shade,
             "cost": E["length"] * mult, "clamped": clamped,
-            "ta_edge": ta_e, "elev": elev,
+            "ta_edge": ta_e, "elev": elev, "uv_frac": uv_frac,
+            "uv_index": wx_block.get("uv_index"),
             "t_wall_c": ta if t_wall_c is None else float(t_wall_c)}
 
 
@@ -505,14 +526,17 @@ def apply(G, E, res):
     Transient: `_stress` / `_utci` / `_mrt` are recomputed every solve and must never be
     pickled into out/graph.pkl (they depend on live weather -- see ENGINE_CONTRACT.md).
     """
-    sh = res.get("shade")
+    sh, uvf = res.get("shade"), res.get("uv_frac")
     for i, ((u, v), s, u_, m) in enumerate(zip(E["edges"], res["stress"], res["utci"], res["mrt"])):
         d = G[u][v]
         d["_stress"] = float(s); d["_utci"] = float(u_); d["_mrt"] = float(m)
         if sh is not None:
             d["_shade"] = float(sh[i])
+        if uvf is not None:
+            d["_uv_frac"] = float(uvf[i])
 
 
 def clear(G):
     for _, _, d in G.edges(data=True):
-        d.pop("_stress", None); d.pop("_utci", None); d.pop("_mrt", None); d.pop("_shade", None)
+        d.pop("_stress", None); d.pop("_utci", None); d.pop("_mrt", None)
+        d.pop("_shade", None); d.pop("_uv_frac", None)

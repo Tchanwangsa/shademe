@@ -1,4 +1,4 @@
-"""Laneway API. Real-time cool-route options for the Melbourne CBD.
+"""ShadeMe API. Real-time cool-route options for the Melbourne CBD.
 
 The physics lives in engine/cost/routing/weather/hours and is unchanged. This module is
 only the surface the mobile client talks to, and it makes three commitments the old
@@ -7,10 +7,10 @@ demo API did not:
   * REAL TIME, NOT A SCRUBBER. There is no `hour` parameter. Every request is priced at
     the wall clock in Australia/Melbourne, clamped to the 06..20 window the shade rasters
     cover. A demo that can be dialled to its best hour is not evidence.
-  * OPTIONS, NOT A PAIR. `/routes` walks a ladder of K -- the single thermal-preference
-    knob -- and returns the distinct paths that fall out of it. Two K values that produce
-    the same walk collapse to one option, which is the honest answer when there is no
-    cooler way to go.
+  * OPTIONS, NOT A PAIR. `/routes` walks a ladder of K -- the thermal-preference knob --
+    AND a second ladder under the UV objective, and returns the distinct paths that fall
+    out of both. Two searches that produce the same walk collapse to one option, which is
+    the honest answer when there is no better way to go.
   * NO FIGURE WITHOUT ITS CONFIG. `meta.provenance` rides on every response.
 """
 import os, sys, time, pickle
@@ -27,21 +27,18 @@ sys.path.insert(0, f"{ROOT}/scripts")
 from . import weather                                                        # noqa: E402
 from . import routing                                                        # noqa: E402
 from . import hours                                                          # noqa: E402
-from .cost import summarise, segments, thermal_summary, compare_thermal      # noqa: E402
+from .cost import (summarise, segments, thermal_summary, compare_thermal,     # noqa: E402
+                   uv_summary, compare_uv)
 
-# THE API SERVES TODAY. weather.SUMMER_DATE is pinned to a January demo day so that the
-# benchmarks and the provenance ladder stay reproducible -- scripts/ import weather
-# directly and must keep getting that fixed day. The live API is the one place that
-# should not: pricing the current hour against a day seven months ago is exactly the
-# "real time" half-truth this rewrite was meant to remove. Overriding the constant here
-# leaves every script untouched, and the archive call for today simply misses (the
-# archive lags a few days) and falls through to the forecast endpoint, which serves it.
+# THE API SERVES TODAY, and it no longer has to reach into `weather` to say so. That
+# module used to carry a SUMMER_DATE constant and a summer/winter mode; this file
+# reassigned the constant at import so the live path would not price an August walk on
+# January weather, which worked but meant the day being served depended on import order.
+# `weather.get()` / `weather.block()` now take a date and default to today, so there is
+# nothing to override. Set SHADEME_DATE=YYYY-MM-DD to pin a demo day.
 #
-# The shade set follows wx["date"], so the first request on a new day regenerates it
-# (~13 s) rather than costing today's walk on January shadows.
-if not os.environ.get("SHADEME_SUMMER_DATE"):
-    import pandas as _pd
-    weather.SUMMER_DATE = str(_pd.Timestamp.now(tz=weather.TZ).date())
+# The shade set follows the weather payload's date, so the first request on a new day
+# regenerates it (~13 s) rather than costing today's walk on yesterday's shadows.
 
 # The shade rasters cover 06:00-20:00. Outside it we clamp and say so in `meta.clamped`
 # rather than quietly pricing 23:00 on the 20:00 sun.
@@ -53,11 +50,22 @@ FALLBACK_HOUR = 16          # only for the graph-rebuild path, never for pricing
 # and 0.30 is about as far as the 1.4x detour cap will let a route wander.
 K_LADDER = (0.0, 0.03, 0.10, 0.30)
 
-# Two options closer than both of these are the same walk as far as the walker is
+# The UV ladder, walked alongside it. A SECOND OBJECTIVE, not a second tuning of the
+# first -- see cost.uv_cost. UV has no air-temperature term, so it stays informative on
+# a cold clear day when every UTCI on the graph is inside the no-stress band and the
+# thermal ladder collapses to a single card. Melbourne sits at UV 3+ (the level at which
+# ARPANSA says to cover up) for most of the year, cold months included.
+# K_uv is "how much further I will walk to swap full sun for full cover", so 0.40 is
+# already at the 1.4x detour cap and there is nothing above it worth asking for.
+K_UV_LADDER = (0.10, 0.25, 0.40)
+
+# Two options closer than ALL of these are the same walk as far as the walker is
 # concerned, and are shown as one card. 1 minute and 5 degC-minutes: below the
 # resolution of a walking-time estimate, and below the dose of a single street crossing.
+# 2 UV index-minutes is 0.03 SED, about 1% of a fair-skin burn threshold.
 SAME_WALK_MIN = 1.0
 SAME_WALK_DOSE = 5.0
+SAME_WALK_UV = 2.0
 
 PLACES_RAW = [
     ("Melbourne Central", -37.81001, 144.96280),
@@ -78,7 +86,7 @@ PLACES_RAW = [
 ]
 
 S = {}          # graph, node arrays, places, provenance
-ENG = {}        # per-mode engine state (edge index + surface march), built lazily
+ENG = {}        # per-day engine state (edge index + surface march), built lazily
 
 
 # --- graph ----------------------------------------------------------------------
@@ -108,7 +116,7 @@ def nearest(lat, lon, max_m=None):
     return S["ids"][i], dist
 
 
-app = FastAPI(title="Laneway")
+app = FastAPI(title="ShadeMe")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
                    allow_headers=["*"])
 
@@ -131,13 +139,13 @@ def startup():
         (places if n else dropped).append({"name": name, "lat": lat, "lon": lon,
                                            "node": n, "snap_m": round(d, 1)})
     S["places"] = places
-    print(f"[laneway] graph {G.number_of_nodes()} nodes / {G.number_of_edges()} edges "
+    print(f"[shademe] graph {G.number_of_nodes()} nodes / {G.number_of_edges()} edges "
           f"from {src} in {time.time() - t0:.1f}s")
-    print(f"[laneway] places ok={len(places)} dropped={[d['name'] for d in dropped]}")
+    print(f"[shademe] places ok={len(places)} dropped={[d['name'] for d in dropped]}")
     try:
-        print(f"[laneway] weather: {weather.block(now_hour(), 'summer')['source']}")
+        print(f"[shademe] weather: {weather.block(now_hour())['source']}")
     except Exception as e:
-        print(f"[laneway] weather prewarm failed: {e}")
+        print(f"[shademe] weather prewarm failed: {e}")
     # NO PROVENANCE STAMP HERE. It cannot be known until a request fixes the day, and
     # therefore the shade set. It is stamped in engine_state() instead.
 
@@ -154,45 +162,58 @@ def now_hour():
 
 
 def condition_code(w):
-    """A coarse sky state for the client's weather glyph.
+    """A coarse sky state for the client's glyph.
 
-    Derived from cloud cover and precipitation, not from an Open-Meteo weather code --
-    the cached payload does not carry one, and inventing a richer taxonomy than the
-    inputs support would be decoration.
+    LED BY THE BEAM, not by cloud cover. Melbourne today reported 78% cloud with
+    438 W/m2 of direct radiation on the horizontal -- thin high cloud the sun comes
+    straight through. Going by cloud alone drew a "partly cloudy" glyph over a city that
+    was, in the user's words, quite sunny. Direct radiation is also the quantity this
+    whole product is about: if the beam is landing, shade is worth walking for, and the
+    icon should agree with the routing.
     """
     if w["precipitation"] >= 0.5:
         return "rain"
     if w["precipitation"] > 0.0:
         return "drizzle"
-    if w["cloud_cover"] >= 80:
-        return "cloudy"
-    if w["cloud_cover"] >= 30:
+    direct, diffuse = w["direct_radiation"], w["diffuse_radiation"]
+    if direct + diffuse < 20:                  # dusk: no beam to read, fall back to cloud
+        return "cloudy" if w["cloud_cover"] >= 60 else "sunny"
+    if w["direct_fraction"] >= 0.5 and direct >= 100:
+        return "sunny"
+    if direct >= 40:
         return "partly_cloudy"
-    return "sunny"
+    return "cloudy"
 
 
 def conditions_block():
-    h = now_hour()
-    w = weather.block(h, "summer")
     t = now_local()
+    h = now_hour()
+    # now_hour() is passed separately from the hour being priced: they differ only when
+    # the wall clock falls outside the shade rasters' 06-20 window, and the live UV
+    # measurement is only allowed to answer for the real current hour. See server/uv.py.
+    w = weather.block(h, now_hour=t.hour)
     return {
         "as_of": t.isoformat(),
         "hour": h,
         "clamped": h != t.hour,
-        # The day actually priced. Normally today; pinned only if SHADEME_SUMMER_DATE is
-        # set. Exposed so the client can say which day it is showing rather than imply
-        # the reading is live when it is not.
-        "date": weather.SUMMER_DATE,
-        "is_today": weather.SUMMER_DATE == str(t.date()),
+        # The day actually priced. Today unless SHADEME_DATE pins it. Exposed so the
+        # client can say which day it is showing rather than imply the reading is live.
+        "date": w["date"],
+        "is_today": w["date"] == str(t.date()),
         "temperature": w["temperature"],
         "apparent_temperature": w["apparent_temperature"],
         "uv_index": w["uv_index"],
+        # Which of the three UV branches answered -- measured, feed, or modelled. A UV
+        # number without this is not checkable against the reading on someone's phone.
+        "uv_source": w["uv_source"],
+        "uv_index_feed": w["uv_index_feed"],
         "condition": condition_code(w),
         "cloud_cover": w["cloud_cover"],
         "precipitation": w["precipitation"],
         "wind_speed": w["wind_speed"],
         "relative_humidity": w["relative_humidity"],
         "direct_radiation": w["direct_radiation"],
+        "direct_fraction": w["direct_fraction"],
         # Kept visible: the level correction is the 28% win and the raw feed is what
         # Open-Meteo actually said. A client that wants to show one must be able to
         # tell them apart.
@@ -213,12 +234,12 @@ def engine_state():
     first route request pays for them, startup does not.
     """
     from . import engine as _e
-    wx = weather.apply_bias(weather.get("summer"))
+    wx = weather.apply_bias(weather.get())
     # THE SHADE SET FOLLOWS THE DATE BEING PRICED, not a mode name, so a request in
     # October cannot be costed on January shadows.
-    sk = wx.get("date") or "summer"
+    sk = wx.get("date") or weather.resolve_day()
     key = (sk, wx.get("ts"), wx.get("bias", {}).get("mode"))
-    st = ENG.get("summer")
+    st = ENG.get(sk)
     if st and st["key"] == key:
         return st
     t0 = time.time()
@@ -226,9 +247,10 @@ def engine_state():
     _e.attach_tsurf(E, S["G"], wx, mode=sk)
     st = {"E": E, "wx": wx, "key": key, "solved": {}, "applied": None,
           "prov": _provenance_for(sk)}
-    ENG["summer"] = st
-    print(f"[laneway] engine state built in {time.time() - t0:.1f}s")
-    print(f"[laneway] provenance {st['prov']}")
+    ENG.clear()                  # one day priced at a time; the march is 38 s and 7 MB
+    ENG[sk] = st
+    print(f"[shademe] engine state built in {time.time() - t0:.1f}s")
+    print(f"[shademe] provenance {st['prov']}")
     return st
 
 
@@ -236,7 +258,7 @@ def _provenance_for(shade_key):
     """Stamp the config for the shade set ACTUALLY being priced.
 
     Stamping once at startup against the default mode was wrong in a way the stamp
-    exists to catch: `provenance.stamp()` defaults to mode="summer", which resolves to
+    exists to catch: `provenance.stamp()` defaults to the January demo set, which is
     out/v2 (sun 2026-01-26), while a request today resolves through _dirs_for() to
     out/v2_winter (sun 2026-08-22). The response would have carried a January shade
     digest next to a route costed on August shadows -- a figure quoted with someone
@@ -248,7 +270,7 @@ def _provenance_for(shade_key):
         import provenance as _p
         return _p.line(_p.stamp(mode=shade_key))
     except Exception as e:
-        print(f"[laneway] provenance stamp failed: {e}")
+        print(f"[shademe] provenance stamp failed: {e}")
         return None
 
 
@@ -272,6 +294,7 @@ def describe(G, path, h, w):
     """Everything one option needs, under the hour and weather already applied."""
     out = summarise(G, path, h, w["direct_radiation"])
     out.update(thermal_summary(G, path))
+    out.update(uv_summary(G, path, w.get("uv_index")))
     es = [G[u][v] for u, v in zip(path, path[1:])]
     L = np.array([float(e["length"]) for e in es])
     if L.sum() > 0:
@@ -283,12 +306,75 @@ def describe(G, path, h, w):
     return out
 
 
-def label_for(opt, coolest_id, shortest_id):
-    if opt["id"] == coolest_id:
-        return "Coolest"
-    if opt["id"] == shortest_id:
-        return "Shortest"
-    return "Balanced"
+def dominates(a, b):
+    """True if option `a` is at least as good as `b` on EVERY axis and better on one.
+
+    Three axes, not one: time, thermal dose and UV dose. The UV axis is not decoration
+    here -- a route that is a minute longer and a degree-minute hotter can still be the
+    only one that keeps you out of the sun, and dropping it as "dominated" would delete
+    the answer to the question the user asked. Adding the objective without adding it to
+    this test is how a second objective quietly stops existing.
+    """
+    ax = (a["summary"]["minutes"], a["summary"].get("stress_load", 0.0),
+          a["summary"].get("uv_dose", 0.0))
+    bx = (b["summary"]["minutes"], b["summary"].get("stress_load", 0.0),
+          b["summary"].get("uv_dose", 0.0))
+    return all(x <= y for x, y in zip(ax, bx)) and any(x < y for x, y in zip(ax, bx))
+
+
+def same_walk(a, b):
+    """True if two options are the same walk to the person doing it. See SAME_WALK_*."""
+    sa, sb = a["summary"], b["summary"]
+    return (abs(sa["minutes"] - sb["minutes"]) <= SAME_WALK_MIN
+            and abs(sa.get("stress_load", 0.0) - sb.get("stress_load", 0.0)) <= SAME_WALK_DOSE
+            and abs(sa.get("uv_dose", 0.0) - sb.get("uv_dose", 0.0)) <= SAME_WALK_UV)
+
+
+def redundant(o, m):
+    """True if `o` offers nothing over `m`: on NO axis does it win by a real margin.
+
+    The Pareto filter in dominates() is strict, so an option that is six seconds quicker
+    and three UV-minutes worse survives it -- technically a trade, practically not one.
+    This is the second sieve: a card that earned none of the three labels has to justify
+    itself against one that did, and "quicker by less than the resolution of a walking-
+    time estimate" does not. Thresholds are the same SAME_WALK_* margins used to merge
+    near-duplicates, for the same reason -- they are the point below which the walker
+    cannot tell two walks apart.
+    """
+    so, sm = o["summary"], m["summary"]
+    return (so["minutes"] > sm["minutes"] - SAME_WALK_MIN
+            and so.get("stress_load", 0.0) > sm.get("stress_load", 0.0) - SAME_WALK_DOSE
+            and so.get("uv_dose", 0.0) > sm.get("uv_dose", 0.0) - SAME_WALK_UV)
+
+
+def label_options(opts, uv_index):
+    """Award each option every label it has actually earned.
+
+    A LIST, not one string. The coolest walk and the least-UV walk are often the same
+    walk, and when they are, saying so is more informative than picking a winner; when
+    they are not, the two badges are exactly the choice being offered.
+
+    "Least UV" is withheld when there is no UV to avoid -- after sunset, or when the
+    index could not be established at all -- rather than pinned on an arbitrary card.
+    """
+    if not opts:
+        return
+    coolest = min(opts, key=lambda o: (o["summary"].get("stress_load", 0.0),
+                                       o["summary"]["minutes"]))["id"]
+    least_uv = min(opts, key=lambda o: (o["summary"].get("uv_dose", 0.0),
+                                        o["summary"]["minutes"]))["id"]
+    spread = max(o["summary"].get("uv_dose", 0.0) for o in opts) - \
+        min(o["summary"].get("uv_dose", 0.0) for o in opts)
+    uv_worth_naming = bool(uv_index) and uv_index > 0 and spread > SAME_WALK_UV
+    for o in opts:
+        labels = []
+        if o["is_shortest"]:
+            labels.append("Shortest")
+        if o["id"] == coolest and o["summary"].get("stress_load", 0.0) > 0:
+            labels.append("Coolest")
+        if uv_worth_naming and o["id"] == least_uv:
+            labels.append("Least UV")
+        o["labels"] = labels
 
 
 @app.get("/health")
@@ -298,10 +384,10 @@ def health():
         raise HTTPException(503, "graph not loaded")
     return {"ok": True, "nodes": G.number_of_nodes(), "edges": G.number_of_edges(),
             "graph_source": S["source"], "places": len(S["places"]),
-            "hour": now_hour(), "date": weather.SUMMER_DATE,
+            "hour": now_hour(), "date": weather.resolve_day(),
             # None until the first route request builds an engine state -- there is no
             # config to report before one has been chosen.
-            "provenance": (ENG.get("summer") or {}).get("prov")}
+            "provenance": next((v.get("prov") for v in ENG.values()), None)}
 
 
 @app.get("/places")
@@ -338,17 +424,19 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
                 ("The starting point is" if s is None else "The destination is")
         far = max(d for d, n in ((ds, s), (dt, t)) if n is None)
         away = f"{far / 1000:.0f} km" if far >= 1000 else f"{far:.0f} m"
-        raise HTTPException(400, f"{which} outside the area Laneway covers. "
+        raise HTTPException(400, f"{which} outside the area ShadeMe covers. "
                                  f"It only knows the Melbourne CBD, and this is "
                                  f"{away} from the nearest walkable street.")
     st = apply_hour(h, w)
 
-    # Walk the K ladder. solve() is cached per hour, so each extra K is one more A* over
-    # a graph that is already warm -- a few ms, not a few seconds.
+    # Walk both ladders. solve() is cached per hour, so each extra search is one more A*
+    # over a graph that is already warm -- a few ms, not a few seconds.
     seen, opts, baseline = {}, [], None
-    for K in K_LADDER:
+    searches = ([("thermal", K, routing.route_utci) for K in K_LADDER]
+                + [("uv", K, routing.route_uv) for K in K_UV_LADDER])
+    for kind, K, fn in searches:
         try:
-            r = routing.route_utci(G, s, t, K, closed)
+            r = fn(G, s, t, K, closed)
         except routing.RouteError as e:
             # Same treatment as the off-network case above: the graph's vocabulary is not
             # the user's. "Snap to the same node" means the two pins landed on one corner.
@@ -360,23 +448,26 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
             baseline = describe(G, r["shortest"], h, w)
         key = tuple(r["path"])
         if key in seen:
-            # Same walk as a lower K already produced. Record that this K reached it and
-            # move on -- collapsing it is the honest answer, not padding the list.
-            seen[key]["K_reached"].append(K)
+            # A walk another search already produced. Record that this one reached it too
+            # and move on -- collapsing it is the honest answer, not padding the list, and
+            # a path that BOTH objectives choose is the strongest card on the list.
+            seen[key]["reached"].append({"kind": kind, "K": K})
             continue
         summ = describe(G, r["path"], h, w)
         avoided = compare_thermal(summ, baseline)
+        avoided.update(compare_uv(summ, baseline))
         avoided["extra_m"] = round(summ["distance_m"] - baseline["distance_m"], 1)
         avoided["extra_s"] = round(avoided["extra_m"] / 1.35, 1)
         # Secondary to the dose, and outdoor-only on both sides: an air-conditioned
         # arcade must not drag a mean down and read as free comfort.
-        a, b = summ.get("utci_mean_outdoor"), baseline.get("utci_mean_outdoor")
-        avoided["utci_outdoor_delta"] = round(b - a, 2) if (a is not None and b is not None) else None
+        a_, b_ = summ.get("utci_mean_outdoor"), baseline.get("utci_mean_outdoor")
+        avoided["utci_outdoor_delta"] = round(b_ - a_, 2) if (a_ is not None and b_ is not None) else None
         opt = {
-            "id": f"k{int(K * 100):03d}",
+            "id": f"{'k' if kind == 'thermal' else 'u'}{int(K * 100):03d}",
+            "objective": kind,
             "K": K,
             "K_effective": r["K_effective"],
-            "K_reached": [K],
+            "reached": [{"kind": kind, "K": K}],
             "is_shortest": list(r["path"]) == list(r["shortest"]),
             "detour_ratio": r["ratio"],
             "detour_capped": r["capped"],
@@ -392,47 +483,60 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
         seen[key] = opt
         opts.append(opt)
 
-    # Drop dominated options: a walk that is BOTH slower and hotter than another one on
-    # the list is not a choice, it is noise. This is not cosmetic -- the mid-ladder K
-    # values genuinely produce such routes here, because route_utci short-circuits at
+    # Drop dominated options: a walk that is worse on time AND heat AND UV than another
+    # one on the list is not a choice, it is noise. This is not cosmetic -- the mid-ladder
+    # K values genuinely produce such routes here, because route_utci short-circuits at
     # K <= 0 and hands back the plain shortest path WITHOUT charging its door crossings,
     # while every K > 0 search pays DOOR_PENALTY_M per door. Where the shortest path
     # happens to run through an arcade, the baseline gets that arcade for free and the
     # K > 0 searches are pushed out of it, landing hotter than the thing they are
     # supposed to improve on. The count is reported rather than swallowed.
-    kept = [o for o in opts if not any(
-        other is not o
-        and other["summary"]["minutes"] <= o["summary"]["minutes"]
-        and other["summary"].get("stress_load", 0.0) <= o["summary"].get("stress_load", 0.0)
-        and (other["summary"]["minutes"] < o["summary"]["minutes"]
-             or other["summary"].get("stress_load", 0.0) < o["summary"].get("stress_load", 0.0))
-        for other in opts)]
+    kept = [o for o in opts if not any(dominates(x, o) for x in opts if x is not o)]
     dominated = len(opts) - len(kept)
     opts = kept
-    # Coolest = least thermal dose, not least mean temperature. Ties break on time.
-    opts.sort(key=lambda o: (o["summary"].get("stress_load", 0.0), o["summary"]["minutes"]))
-    # Collapse near-duplicates. Two walks that differ by six seconds and half a degC-min
-    # are the same walk to the person doing it, and offering both as cards makes the
-    # list look precise rather than useful. The survivor is the cooler one -- the list is
-    # already sorted that way -- and it absorbs the other's K so nothing is lost.
+    # Coolest first, then least UV, then quickest. In winter the first key is 0 for every
+    # option and the ordering falls through to UV, which is the axis still carrying
+    # information -- so the list re-sorts itself around whatever is actually varying
+    # rather than needing a season to be declared anywhere.
+    opts.sort(key=lambda o: (o["summary"].get("stress_load", 0.0),
+                             o["summary"].get("uv_dose", 0.0),
+                             o["summary"]["minutes"]))
+    # Collapse near-duplicates. Two walks that differ by six seconds, half a degC-min and
+    # a fraction of a UV-minute are the same walk to the person doing it, and offering
+    # both as cards makes the list look precise rather than useful.
+    #
+    # THE SURVIVOR IS THE QUICKER ONE, not the one that happened to sort first. If two
+    # walks are equivalent on every objective, the tie-break left is distance, and
+    # keeping the longer geometry showed the user a 25 m detour with nothing to show for
+    # it -- and, worse, dropped the `is_shortest` flag with the card it belonged to, so
+    # the direct route stopped being labelled as the direct route. The kept option
+    # absorbs the other's searches so nothing is lost from `reached`.
     merged, near = [], 0
     for o in opts:
-        twin = next((m for m in merged
-                     if abs(m["summary"]["minutes"] - o["summary"]["minutes"]) <= SAME_WALK_MIN
-                     and abs(m["summary"].get("stress_load", 0.0)
-                             - o["summary"].get("stress_load", 0.0)) <= SAME_WALK_DOSE), None)
-        if twin:
-            twin["K_reached"].extend(o["K_reached"])
-            near += 1
-        else:
+        i = next((i for i, m in enumerate(merged) if same_walk(m, o)), None)
+        if i is None:
             merged.append(o)
+            continue
+        near += 1
+        m = merged[i]
+        keep, drop = ((m, o) if m["summary"]["minutes"] <= o["summary"]["minutes"]
+                      else (o, m))
+        keep["reached"] = keep["reached"] + drop["reached"]
+        merged[i] = keep
     opts = merged
-    coolest_id = opts[0]["id"]
-    shortest_id = next((o["id"] for o in opts if o["is_shortest"]), None)
+    label_options(opts, cond.get("uv_index"))
+    # An option that earned no label is a middle route nobody asked for. Keep it only if
+    # it actually beats a labelled one somewhere by a margin a person could notice.
+    named = [o for o in opts if o["labels"]]
+    kept = [o for o in opts
+            if o["labels"] or not any(redundant(o, m) for m in named)]
+    unlabelled = len(opts) - len(kept)
+    opts = kept
     for o in opts:
-        o["label"] = label_for(o, coolest_id, shortest_id)
-    # One option means there is no cooler way to go right now. Say it plainly rather
-    # than manufacturing a second card.
+        # "Balanced" only means something next to something else. One option is one
+        # option -- badging it says nothing the card does not already say.
+        o["labels"] = o["labels"] or (["Balanced"] if len(opts) > 1 else [])
+        o["label"] = o["labels"][0] if o["labels"] else None
     return {
         "conditions": cond,
         "options": opts,
@@ -441,9 +545,12 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
             "hour": h,
             "as_of": cond["as_of"],
             "k_ladder": list(K_LADDER),
+            "k_uv_ladder": list(K_UV_LADDER),
+            "uv_index": cond.get("uv_index"),
             "distinct_paths": len(opts),
             "dominated_dropped": dominated,
             "near_duplicates_merged": near,
+            "unlabelled_dropped": unlabelled,
             "availability": dict(hours.describe(h, dw), enforced=respect_hours),
             "detour_cap": routing.DETOUR_CAP,
             # Additive and deliberately on every response: any number taken out of this

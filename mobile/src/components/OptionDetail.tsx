@@ -1,7 +1,7 @@
 import { View, Text } from 'react-native';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import type { RouteOption, RoutesMeta } from '../lib/api';
-import { arrival, degrees, distance, dose, minutes, pct } from '../lib/format';
+import { arrival, degrees, distance, dose, minutes, pct, uvDose } from '../lib/format';
 import { useTheme } from '../lib/theme';
 import { ExposureBar } from './ExposureBar';
 import { Surface } from './ui/Card';
@@ -29,16 +29,20 @@ function Note({ icon, children }: { icon: string; children: React.ReactNode }) {
   );
 }
 
-export function OptionDetail({
-  option,
-  meta,
-}: {
-  option: RouteOption;
-  meta: RoutesMeta;
-}) {
+/** The expanded detail for the selected option.
+ *
+ * Notes here describe THIS WALK and nothing else. Caveats about the engine's assumptions
+ * belong in the code and the contract, not stacked under a route card: a person deciding
+ * which way to walk cannot act on them, and they crowd out the two or three facts that
+ * do change the decision.
+ */
+export function OptionDetail({ option, meta }: { option: RouteOption; meta: RoutesMeta }) {
   const s = option.summary;
   const feels = s.utci_mean_outdoor;
   const closed = meta.availability.closed_classes;
+  const heatSaved = option.avoided.stress_load_avoided;
+  const uvSaved = option.avoided.uv_dose_avoided ?? 0;
+  const showsUvTile = s.uv_dose != null && meta.uv_index != null && meta.uv_index > 0;
 
   return (
     <View>
@@ -47,12 +51,13 @@ export function OptionDetail({
       </Text>
 
       <View className="mt-3 flex-row gap-2">
-        <Tile
-          label="Feels like"
-          value={feels != null ? degrees(feels) : '—'}
-        />
+        <Tile label="Feels like" value={feels != null ? degrees(feels) : '—'} />
         <Tile label="In sun" value={minutes(s.sun_minutes)} />
-        <Tile label="Climb" value={`${Math.round(s.climb_m)} m`} />
+        {showsUvTile ? (
+          <Tile label="UV dose" value={uvDose(s.uv_dose!)} />
+        ) : (
+          <Tile label="Climb" value={`${Math.round(s.climb_m)} m`} />
+        )}
       </View>
 
       <View className="mt-3">
@@ -60,15 +65,17 @@ export function OptionDetail({
       </View>
 
       <View className="mt-3 border-t border-line pt-2.5 dark:border-line-dark">
-        {!option.is_shortest && option.avoided.stress_load_avoided > 0.5 ? (
+        {!option.is_shortest && heatSaved > 0.5 ? (
           <Note icon="thermometer-outline">
-            {`${dose(option.avoided.stress_load_avoided)} less heat than walking direct, for ${Math.round(option.avoided.extra_m)} m further`}
+            {`${dose(heatSaved)} less heat than walking direct, for ${Math.round(option.avoided.extra_m)} m further`}
           </Note>
-        ) : (
-          <Note icon="navigate-outline">
-            This is the direct route — there is no cooler way to go right now
+        ) : null}
+
+        {!option.is_shortest && uvSaved > 0.5 ? (
+          <Note icon="sunny-outline">
+            {`${uvDose(uvSaved)} less UV than walking direct${heatSaved > 0.5 ? '' : `, for ${Math.round(option.avoided.extra_m)} m further`}`}
           </Note>
-        )}
+        ) : null}
 
         {s.doors > 0 ? (
           <Note icon="enter-outline">
@@ -80,19 +87,6 @@ export function OptionDetail({
           <Note icon="lock-closed-outline">
             {`Routed around what is shut right now: ${closed.join(', ')}`}
           </Note>
-        ) : null}
-
-        {s.indoor_pct >= 1 ? (
-          <Text className="mt-2.5 text-[11px] leading-4 text-ink-soft">
-            Indoor legs are priced at a fixed 22.5° — an assumption, not a measurement.
-            Most of the difference above comes from air conditioning rather than shade.
-          </Text>
-        ) : null}
-
-        {meta.provenance ? (
-          <Text className="mt-2 text-[10px] leading-4 text-ink-soft" numberOfLines={2}>
-            {meta.provenance}
-          </Text>
         ) : null}
       </View>
     </View>

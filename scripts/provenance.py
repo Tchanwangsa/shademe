@@ -94,12 +94,14 @@ def stamp(mode="summer", hours=range(6, 21)):
         s["physics"] = {"error": repr(e)}
 
     try:
-        from server.cost import (K_DEFAULT, DOOR_PENALTY_M, RISE_M_PER_M,
-                                 LEVEL_JUMP_M)
+        from server.cost import (K_DEFAULT, K_UV_DEFAULT, DOOR_PENALTY_M,
+                                 RISE_M_PER_M, LEVEL_JUMP_M)
         from server.engine import INDOOR_TA, COVERED_VA_F, INDOOR_VA
+        from server.uv import UV_DIFFUSE_FLOOR
         # The door and the climb move routes as surely as K does -- a figure quoted
         # without them is as unattributable as one quoted without the shade rasters.
-        s["cost"] = {"K": K_DEFAULT, "INDOOR_TA": INDOOR_TA,
+        s["cost"] = {"K": K_DEFAULT, "K_uv": K_UV_DEFAULT,
+                     "uv_diffuse_floor": UV_DIFFUSE_FLOOR, "INDOOR_TA": INDOOR_TA,
                      "INDOOR_VA": INDOOR_VA, "COVERED_VA_F": COVERED_VA_F,
                      "door_m": DOOR_PENALTY_M, "rise_m_per_m": RISE_M_PER_M,
                      "level_jump_m": LEVEL_JUMP_M}
@@ -149,27 +151,30 @@ def stamp(mode="summer", hours=range(6, 21)):
                 ("shadow.py", "surface_temp.py", "mrt.py", "canopy_svf.py")}
 
     # --- which day the weather came from ----------------------------------------
+    # One cache file per DAY now (weather_cache_YYYY-MM-DD.json), rather than one per
+    # season -- server/weather no longer has modes. Stamp every day present so a figure
+    # can be traced to the payload it was priced on.
     s["weather"] = {}
-    for name, f in (("summer", "weather_cache_summer.json"),
-                    ("winter", "weather_cache_winter.json")):
-        p = f"{ROOT}/data/{f}"
-        if os.path.exists(p):
-            try:
-                w = json.load(open(p))
-                s["weather"][name] = {"date": w.get("date") or w.get("day"),
-                                      "sha": sha(p, cache)}
-            except Exception:
-                s["weather"][name] = {"sha": sha(p, cache)}
+    import glob
+    for p in sorted(glob.glob(f"{ROOT}/data/weather_cache_*.json")):
+        name = os.path.basename(p)[len("weather_cache_"):-len(".json")]
+        try:
+            w = json.load(open(p))
+            s["weather"][name] = {"date": w.get("date") or w.get("day"),
+                                  "sha": sha(p, cache)}
+        except Exception:
+            s["weather"][name] = {"sha": sha(p, cache)}
     # Read the LIVE value, not the environment variable that is only one way of setting
-    # it. server/main.py overrides weather.SUMMER_DATE at import so the API prices today
-    # while scripts/ keep the pinned demo day; re-reading the env var here stamped
+    # it. `resolve_day()` returns the pin if one is set and today otherwise, which is
+    # exactly what the engine will have priced; re-reading the env var here stamped
     # "demo day 2026-01-26" onto routes actually costed on today's weather -- a figure
     # carrying someone else's config, which is the failure this module exists to prevent.
     try:
-        from server.weather import SUMMER_DATE as _sd
-        s["demo_day"] = _sd
+        from server.weather import resolve_day as _rd
+        s["demo_day"] = _rd()
     except Exception:
-        s["demo_day"] = os.environ.get("SHADEME_SUMMER_DATE", "2026-01-26")
+        s["demo_day"] = os.environ.get("SHADEME_DATE") or \
+            os.environ.get("SHADEME_SUMMER_DATE", "2026-01-26")
 
     # --- the bias correction applied to that weather -----------------------------
     # Every temperature the engine reports now passes through this, so a figure quoted
@@ -178,8 +183,11 @@ def stamp(mode="summer", hours=range(6, 21)):
     # re-fit shows up as a different stamp even at the same mode.
     try:
         from server.weather import BIAS_PATH, ta_offset
-        _, bm = ta_offset(14, s["weather"].get("summer", {}).get("date", "2026-01-26")
-                          if s.get("weather") else "2026-01-26")
+        # Keyed on the day ACTUALLY being priced. This used to read a "summer" entry out
+        # of the weather-cache map and fall back to a hardcoded January date when it was
+        # missing, so an August request was stamped `season-shape[DJF]` while the engine
+        # had applied `[JJA]` -- the stamp naming a correction that was never used.
+        _, bm = ta_offset(14, s.get("demo_day") or "2026-01-26")
         s["bias"] = {"mode": bm, "table": sha(BIAS_PATH, cache)}
     except Exception as e:
         s["bias"] = {"error": repr(e)}
@@ -202,6 +210,8 @@ def line(s=None, **kw):
         + (f" (sun {s['shade']['day']})" if s['shade'].get('day') else ""),
         f"svf {os.path.basename(s['svf']['path'] or '-')} {s['svf']['sha']}",
         f"K={c.get('K')}" if "K" in c else None,
+        # A UV figure is as unattributable without these as a thermal one is without K.
+        f"K_uv={c.get('K_uv')} uvdif={c.get('uv_diffuse_floor')}" if "K_uv" in c else None,
         f"door={c.get('door_m')}m rise={c.get('rise_m_per_m')}x" if "door_m" in c else None,
         f"INDOOR_TA={c.get('INDOOR_TA')}" if "INDOOR_TA" in c else None,
         f"TAU_LEAF={p.get('TAU_LEAF')} RAY_STEP={p.get('RAY_STEP')} beam={p.get('BEAM')}",

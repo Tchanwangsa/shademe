@@ -1,7 +1,8 @@
 import { API_BASE } from './config';
 
 export type ConditionCode = 'sunny' | 'partly_cloudy' | 'cloudy' | 'drizzle' | 'rain';
-export type OptionLabel = 'Coolest' | 'Balanced' | 'Shortest';
+export type OptionLabel = 'Coolest' | 'Balanced' | 'Shortest' | 'Least UV';
+export type Objective = 'thermal' | 'uv';
 
 export interface Conditions {
   as_of: string;
@@ -13,13 +14,18 @@ export interface Conditions {
   is_today: boolean;
   temperature: number;
   apparent_temperature: number;
-  uv_index: number;
+  /** Null when neither the live network nor the feed could answer. Show nothing then. */
+  uv_index: number | null;
+  /** Which branch answered: ARPANSA measurement, the feed, or a clear-sky model. */
+  uv_source: string;
+  uv_index_feed: number | null;
   condition: ConditionCode;
   cloud_cover: number;
   precipitation: number;
   wind_speed: number;
   relative_humidity: number;
   direct_radiation: number;
+  direct_fraction: number;
   /** What Open-Meteo actually said, before the fitted level correction. */
   temperature_raw: number;
   bias_mode: string;
@@ -49,6 +55,14 @@ export interface Summary {
   utci_mean_outdoor?: number | null;
   utci_mean?: number;
   mrt_mean?: number;
+  /** UV index-minutes collected over the walk. The UV analogue of stress_load. */
+  uv_dose?: number;
+  /** The same dose in standard erythemal doses; ~2 SED reddens untanned fair skin. */
+  uv_sed?: number;
+  uv_exposed_minutes?: number;
+  /** Mean share of the open-sky UV index along the route, 0..1. Day-independent. */
+  uv_mean_frac?: number | null;
+  uv_peak?: number;
 }
 
 export interface Avoided {
@@ -61,6 +75,9 @@ export interface Avoided {
   extra_m: number;
   extra_s: number;
   utci_outdoor_delta: number | null;
+  uv_dose_avoided?: number;
+  uv_sed_avoided?: number;
+  uv_dose_avoided_pct?: number | null;
 }
 
 export interface Segment {
@@ -73,10 +90,15 @@ export interface Segment {
 
 export interface RouteOption {
   id: string;
-  label: OptionLabel;
+  /** Every label this option earned. Empty when it is the only option on the list. */
+  labels: OptionLabel[];
+  /** labels[0], or null. Kept for compatibility; render `labels`. */
+  label: OptionLabel | null;
+  /** Which search produced it. Both ladders feed one list. */
+  objective: Objective;
   K: number;
   K_effective: number;
-  K_reached: number[];
+  reached: { kind: Objective; K: number }[];
   is_shortest: boolean;
   detour_ratio: number;
   detour_capped: boolean;
@@ -94,7 +116,12 @@ export interface RoutesMeta {
   hour: number;
   as_of: string;
   k_ladder: number[];
+  k_uv_ladder: number[];
+  uv_index: number | null;
   distinct_paths: number;
+  dominated_dropped: number;
+  near_duplicates_merged: number;
+  unlabelled_dropped: number;
   availability: { dow: string; hour: number; closed_classes: string[]; enforced: boolean };
   detour_cap: number;
   provenance: string | null;

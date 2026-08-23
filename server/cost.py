@@ -256,6 +256,90 @@ def utci_cost(d, K=None, rise=None):
     return L * (1.0 + K * float(s))
 
 
+# --- the UV objective ---------------------------------------------------------
+# A SECOND preference, not a re-weighting of the first. `_uv_frac` (server/engine.solve)
+# is the share of the open-sky UV index reaching an edge, in [0,1]: 1 in open sun, 0
+# under a roof, and around 0.5 in a building's shadow on an open plaza, because roughly
+# half of erythemal UV is skylight. Cost is the same shape as utci_cost:
+#
+#     cost = equivalent length * (1 + K_uv * uv_frac)
+#
+# K_uv IS DIRECTLY READABLE, which is the reason for normalising to a fraction rather
+# than costing the index itself. It is "how much further I will walk to swap full sun
+# for full cover": 0.25 means a quarter further. Costing the raw index instead would
+# make the knob mean something different on a UV 3 winter day than on a UV 12 January
+# one, and the SHAPE of the least-UV path does not in fact depend on the day's level --
+# it scales out. Only the cloudiness matters, through the beam/sky split.
+#
+# NOT SWEPT, and said plainly: K (thermal) has a 12-point sweep behind it in this file
+# against a 40-pair benchmark, and this has nothing of the sort. 0.25 is chosen so the
+# ladder spans the reachable space under the 1.4 detour cap rather than fitted to an
+# outcome, and there is no UV ground truth on the graph to fit it against anyway -- the
+# shadow model itself has no external validation (scripts/validate_sensors.py --shade-lux
+# came back null). Treat it as a stated preference.
+K_UV_DEFAULT = float(__import__("os").environ.get("SHADEME_K_UV", "0.25"))
+
+
+def uv_cost(d, K=None, rise=None):
+    """Edge cost under the UV preference. Plain length if the engine has not run."""
+    L = equiv_length(d, rise)
+    f = d.get("_uv_frac")
+    if f is None:
+        return L
+    K = K_UV_DEFAULT if K is None else float(K)
+    return L * (1.0 + K * float(f))
+
+
+def uv_summary(G, path, uv_index):
+    """UV dose over one walk. {} if the engine has not run or there is no index.
+
+    The dose is index-minutes: the local index integrated over the time spent in it,
+    exactly parallel to the degC-minutes thermal_summary reports and for the same reason
+    -- it is additive along the path, it is zero when there is nothing to avoid, and it
+    is the quantity the router minimises. `sed` restates it in standard erythemal doses,
+    which is the unit the burn actually happens in (~2 SED reddens untanned fair skin).
+
+    Distinct from thermal exposure on purpose: a walk can be 100% thermally comfortable
+    and still collect a full dose.
+    """
+    from . import uv as UV
+    es = _edges(G, path)
+    if not es or all(e.get("_uv_frac") is None for e in es):
+        return {}
+    idx = 0.0 if uv_index is None else float(uv_index)
+    dose = exposed_min = frac_m = m = 0.0
+    peak = 0.0
+    for d in es:
+        f = d.get("_uv_frac")
+        if f is None:
+            continue
+        f = float(f)
+        L = float(d["length"])
+        mins = equiv_length(d) / WALK_MPS / 60.0
+        dose += idx * f * mins
+        if f > 0.5:
+            exposed_min += mins
+        frac_m += f * L
+        m += L
+        peak = max(peak, idx * f)
+    return {"uv_dose": round(dose, 2),
+            "uv_sed": round(UV.sed(dose), 3),
+            "uv_exposed_minutes": round(exposed_min, 1),
+            "uv_mean_frac": round(frac_m / m, 3) if m > 0 else None,
+            "uv_peak": round(peak, 1),
+            "uv_index": None if uv_index is None else round(idx, 1)}
+
+
+def compare_uv(chosen, shortest):
+    """How much UV dose the chosen route avoids against the direct one."""
+    if not chosen or not shortest:
+        return {}
+    base, got = shortest.get("uv_dose", 0.0), chosen.get("uv_dose", 0.0)
+    return {"uv_dose_avoided": round(base - got, 2),
+            "uv_sed_avoided": round(shortest.get("uv_sed", 0.0) - chosen.get("uv_sed", 0.0), 3),
+            "uv_dose_avoided_pct": round((base - got) / base * 100.0, 1) if base > 0.01 else None}
+
+
 def edge_shade(d, hour):
     """Shade in [0,1] for this edge at `hour`.
 
