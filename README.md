@@ -99,6 +99,10 @@ A healthy response names the graph it loaded:
 {"ok":true,"nodes":49065,"edges":60957,"graph_source":"out/graph.pkl (19:15)","hour":19,...}
 ```
 
+`notebooks/` is a submodule and stays empty unless you ask for it — nothing in the API
+or the pipeline touches it. To get it: `git submodule update --init`, then
+`uv sync --group notebooks`.
+
 `build_all` takes about **7.5 minutes** from a clean clone and only has to be run once —
 see [Building the derived data](#building-the-derived-data) for what it does and how to
 resume it if a download fails. Everything after that starts in seconds.
