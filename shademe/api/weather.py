@@ -7,6 +7,7 @@ benchmarks reproduce; they pass one explicitly or set SHADEME_DATE.
 """
 import os, json, time, requests
 
+from . import sky as SKY
 from . import uv as UV
 from ..paths import DATA
 
@@ -339,18 +340,54 @@ def apply_bias(p):
     return q
 
 
-def solar_elevation(day, hour):
-    """Solar elevation in degrees, or None if the astronomy helper is not importable.
+def solar_elevation(day, hour, minutes=0, tz=TZ):
+    """Solar elevation in degrees at `day hour:minutes`, or None if pvlib is missing.
 
-    Only the archive path needs it (uv.clear_sky), so an ImportError must degrade to "no
-    UV" rather than take the weather block down with it.
+    An ImportError must degrade to "no UV" and "no sky state" rather than take the
+    weather block down with it, so every caller has to handle None.
     """
     try:
         import pandas as pd
         from ..physics.shadow import sun_position
-        return float(sun_position(pd.Timestamp(f"{day} {int(hour):02d}:00", tz=TZ))[1])
+        t = pd.Timestamp(f"{day} {int(hour):02d}:00", tz=tz) + pd.Timedelta(minutes=minutes)
+        return float(sun_position(t)[1])
     except Exception:
         return None
+
+
+# Open-Meteo labels its hourly rows in a FIXED +10:00 for Melbourne -- it returns
+# `utc_offset_seconds: 36000` for a January range as well as an August one, so its
+# summer timestamps do not carry AEDT -- and each row is the MEAN OVER THE PRECEDING
+# HOUR. So the radiation in row `hh` was collected over [hh-1, hh] in +10:00, and the
+# instant that represents it is half an hour before the label, in that fixed frame.
+#
+# Measured rather than assumed. Sweeping the offset and scoring the spread of the
+# clear-sky index over clear hours (cloud <= 5%, sun above 20 deg) of Melbourne archive:
+#
+#     offset      summer (AEDT)        winter (AEST)
+#     -60 min     mean 0.95 sd 0.38    mean 0.92 sd 0.12
+#     -30 min     mean 0.95 sd 0.30    mean 0.95 sd 0.06   <- winner, AEST frame
+#       0 min     mean 1.00 sd 0.14    mean 0.96 sd 0.13
+#     +30 min     mean 1.01 sd 0.06    mean 0.94 sd 0.22   <- winner, AEDT frame
+#
+# The two seasons want offsets exactly one hour apart in a DST-aware frame, and the SAME
+# -30 min in the fixed +10:00 frame (sd 0.055 summer, 0.063 winter). That is the DST gap,
+# and it is the proof of the fixed frame.
+#
+# CAVEAT, AND IT IS BIGGER THAN THIS FUNCTION. Everything else in this project reads row
+# `hh` as "local hour hh" -- the shade raster for hh is cast at hh:00 local, and the
+# surface march forces hour hh with row hh. Under the frame above that is right to within
+# half an hour in winter and an hour out in summer. Fixing it moves every temperature,
+# radiation and UTCI figure the project reports and wants its own validation, so it has
+# NOT been done here. This function exists so the sky glyph at least divides by the right
+# clear-sky number; it does not repair the alignment underneath it.
+FEED_TZ = "Etc/GMT-10"          # fixed +10:00 -- Open-Meteo's frame, DST or not
+FEED_ROW_MINUTES = -30          # rows are the mean over the preceding hour
+
+
+def row_elevation(day, hour):
+    """Solar elevation over the window row `hour` averaged its radiation over."""
+    return solar_elevation(day, hour, FEED_ROW_MINUTES, FEED_TZ)
 
 
 def block(hour, day=None, now_hour=None, wet=False):
@@ -394,14 +431,31 @@ def block(hour, day=None, now_hour=None, wet=False):
     if uv_feed is None:
         uv_feed = r.get("uv_index_clear_sky")
     cloud = _f(r.get("cloud_cover"))
+    # Two solar elevations, because two different questions are asked of the sun.
+    # `elev` is the instant this hour is priced at -- the same instant the shade raster
+    # for it was cast at -- and answers "is the sun up". `elev_row` is the window the
+    # radiation above was averaged over, and is the only elevation the beam may be
+    # divided by. See row_elevation for why they differ. Both are None without pvlib.
+    elev = solar_elevation(p.get("date"), h)
+    elev_row = row_elevation(p.get("date"), h)
     uv, uv_source = UV.index_for(h, now_hour if now_hour is not None else -1,
                                  None if uv_feed is None else float(uv_feed), cloud,
-                                 elev_deg=solar_elevation(p.get("date"), h))
+                                 elev_deg=elev)
+    cond, cond_why = SKY.condition(direct, diffuse, cloud, precip, elev, elev_row)
     if not wet:
         w_wet = 0.0                              # legacy weight; off unless asked for
     return {
         "date": p.get("date"),
         "hour": h,
+        # The sky glyph and the number that chose it. NOT derived from cloud cover except
+        # in the branch `condition_source` names as such -- see api/sky.py.
+        "condition": cond,
+        "condition_source": cond_why,
+        "solar_elevation": None if elev is None else round(elev, 1),
+        "solar_elevation_row": None if elev_row is None else round(elev_row, 1),
+        "beam_fraction": (lambda k: None if k is None else round(k, 3))(
+            SKY.beam_fraction(direct, elev_row)),
+        "beam_clear": round(SKY.beam_clear(elev_row), 1),
         "temperature": round(temp, 1),
         "apparent_temperature": round(app, 1),
         "direct_radiation": round(direct, 1),
