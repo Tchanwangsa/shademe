@@ -113,6 +113,115 @@ def utci_cost(d, K=None, rise=None):
     return L * (1.0 + K * float(s))
 
 
+# --- whose cost is it: the personal K -----------------------------------------
+# K is a PREFERENCE, and a preference belongs to a person. The same UTCI is not the same
+# experience for everyone standing in it, and two of the reasons are INDEPENDENT:
+#
+#   ACCLIMATISATION is recent history. One to two weeks of repeated exposure earns a
+#   lower heart rate, earlier and more dilute sweating and a steadier blood pressure in
+#   heat. Someone who has not built that up -- a visitor, a recent arrival, or anyone at
+#   all in the first hot week of a season, which catches a whole city unadapted at once
+#   -- is working harder for the same reading on the same footpath.
+#
+#   VULNERABILITY is capacity, not history. Age, pregnancy, and cardiac or renal
+#   conditions reduce the ability to shed heat at all. Acclimatising raises that person's
+#   own baseline; it does not lift the ceiling, so it does not substitute for this.
+#
+# They compose rather than override, which is why there are two questions and not one
+# severity slider: a long-time resident can be vulnerable, a healthy visitor can be
+# unacclimatised, and an elderly visitor in the first week of a heatwave is both.
+#
+# WHAT THIS IS NOT. Not a clinical risk score, and deliberately not per-condition: one
+# flag covers three quite different physiologies, which is exactly as fine-grained as the
+# evidence behind the number here. The DIRECTION is well established. The MAGNITUDE is
+# asserted -- 1.8x per flag, from "a walk worth 6% further per degree of stress to an
+# adapted adult is worth about 11% to someone who is not" -- and it is a stated
+# preference with nothing more behind it than K_DEFAULT itself has. Said plainly, in the
+# same words that file uses about K: a preference, not a measurement.
+#
+# WHAT MAKES AN UNCALIBRATED NUMBER SAFE TO SHIP is that it cannot run away. K buys one
+# thing, detour; routing.DETOUR_CAP bounds the detour at 1.4x the direct walk whatever K
+# asks for, and _route_pref halves K until it fits. So the worst case of an overestimate
+# is a walk 40% longer than the shortest one, reported on the card as `detour_capped`
+# with the `K_effective` it actually landed on. There is no setting of these two flags
+# that sends anyone anywhere the unpersonalised app would refuse to send them.
+#
+# NOT APPLIED TO K_UV. Heat acclimatisation and cardiac capacity have nothing to do with
+# how much erythemal UV a person should collect -- that scales with skin type, which this
+# does not ask about. Scaling both ladders from one answer would be borrowing the
+# authority of a heat question to move a UV route.
+SENSITIVITY_PER_FLAG = 1.8
+
+
+def k_multiplier(unacclimatised=False, vulnerable=False):
+    """How much more one degree of stress is worth to this walker. 1.0 by default.
+
+    MULTIPLICATIVE, because the two conditions are independent: both flags land on 3.24x
+    whichever order they are applied in. Additive composition would make the second flag
+    worth less than the first, which is a claim about an interaction between them that
+    nothing here can support.
+    """
+    m = 1.0
+    if unacclimatised:
+        m *= SENSITIVITY_PER_FLAG
+    if vulnerable:
+        m *= SENSITIVITY_PER_FLAG
+    return round(m, 4)
+
+
+def scale_ladder(ladder, mult):
+    """The rungs of K this walker's preferences actually span.
+
+    SCALED, not shifted or replaced, so K = 0 stays 0 under every multiplier. Keeping the
+    no-preference rung is deliberate: the shortest walk is the baseline every "less heat"
+    figure on every card is measured against, and withholding it from a vulnerable user
+    would remove the comparison rather than the risk.
+
+    Rungs pushed past the detour cap do NOT produce longer detours -- _route_pref halves
+    them back under it -- so they return a walk a lower rung already found and collapse in
+    /routes' de-duplication. A ladder that ends in one card is the honest report that
+    there is nothing further to buy: past a point the limit is the cap, not the person.
+    """
+    return tuple(round(k * float(mult), 4) for k in ladder)
+
+
+def weighted_minutes(summary, K, door_m=None):
+    """The router's own objective, restated per ROUTE in minutes, under this walker's K.
+
+    The edge cost sums along a path to `equivalent metres + K * sum(L * s)`, and
+    thermal_summary's `stress_load` is `sum(s * L) / (WALK_MPS * 60)`, so dividing the
+    whole thing through by WALK_MPS * 60 leaves a quantity in minutes:
+
+        weighted minutes = minutes + K * stress_load + doors * door_m / (WALK_MPS * 60)
+
+    NOT A NEW OBJECTIVE -- the same one the A* minimised, evaluated on a finished route so
+    that walks produced by DIFFERENT searches can be ranked against each other on one
+    scale. That is the whole reason it exists: /routes walks a ladder, and a ladder
+    returns options, not a recommendation. Someone still has to say which one is for you,
+    and the honest way to say it is with the parameter the model already has.
+
+    DOORS ARE PRICED HERE FOR EVERY OPTION, including the K = 0 walk that was not charged
+    them during its search (see routing._route_pref). Ranking options means one price
+    list; leaving the baseline's doors free would recommend it for being cheaper to
+    search, not better to walk.
+
+    THERMAL ONLY. UV dose is not folded in, at any weight. cost.uv_cost is a second
+    preference rather than a re-weighting of the first, and combining them needs an
+    exchange rate between a degC-minute and a UV index-minute that nothing in this
+    project measures. The UV options stay on the list carrying their own badge; this
+    ranks on heat and says so.
+
+    The imputed storey climb (LEVEL_JUMP_M) is left out -- it is charged per transition
+    inside the search and never reaches the summary. It is small beside the door price
+    and falls on the same indoor walks, so it moves the scores together.
+    """
+    d = DOOR_PENALTY_M if door_m is None else float(door_m)
+    doors = float(summary.get("doors", 0) or 0)
+    return (float(summary["minutes"])
+            + float(K) * float(summary.get("stress_load", 0.0) or 0.0)
+            + doors * d / (WALK_MPS * 60.0))
+
+
 # --- the UV objective ---------------------------------------------------------
 # A SECOND preference, not a re-weighting of the first. `_uv_frac` (engine.solve) is the
 # share of the open-sky UV index reaching an edge: 1 in open sun, 0 under a roof, ~0.5 in

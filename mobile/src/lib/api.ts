@@ -1,4 +1,5 @@
 import { API_BASE } from './config';
+import { isDefault, type Walker } from './walker';
 
 export type ConditionCode =
   | 'sunny'
@@ -128,6 +129,15 @@ export interface RouteOption {
   relax_attempts: number;
   door_m: number;
   level_jump_m: number;
+  /** The route priced in minutes under THIS walker's K: `minutes + K * stress_load`,
+   *  plus the door price charged to every option alike. The router's own objective
+   *  restated per route, which is what makes options from different searches
+   *  comparable. Thermal only — UV is a second preference, not a term in this one. */
+  weighted_minutes: number;
+  /** Exactly one option carries this, and only when there is more than one to choose
+   *  between. It is the least `weighted_minutes`, so it moves toward the cooler walk as
+   *  the heat-sensitivity answers push K up. */
+  recommended: boolean;
   summary: Summary;
   avoided: Avoided;
   geometry: { type: 'LineString'; coordinates: [number, number][] };
@@ -149,7 +159,12 @@ export interface RoutesMeta {
   /** Spacing of the shade/Ts grid this was priced on, in minutes. */
   step_min: number;
   as_of: string;
+  /** The thermal ladder actually searched — the base ladder scaled by the walker's
+   *  K multiplier. */
   k_ladder: number[];
+  /** The ladder a walker who declared nothing gets. `k_ladder` divided by
+   *  `walker.k_multiplier`. */
+  k_ladder_base: number[];
   k_uv_ladder: number[];
   uv_index: number | null;
   distinct_paths: number;
@@ -165,6 +180,22 @@ export interface RoutesMeta {
   /** The weather fetch those surface temperatures came from. */
   engine_as_of: string | null;
   provenance: string | null;
+  /** Which K the ladder and the recommendation were priced under, and the two answers
+   *  that produced it — echoed back rather than assumed, so a client that sent nothing
+   *  can see that nothing was applied. Same job as `provenance`: no figure without the
+   *  config behind it.
+   *
+   *  OPTIONAL BECAUSE THE SERVER MIGHT BE OLDER. A phone points at whatever API_BASE
+   *  says, which during development is regularly a laptop running a build from before
+   *  this field existed. Typed as present-or-absent so reading it has to be guarded,
+   *  rather than typed as always-there and crashing the route sheet when it is not. */
+  walker?: {
+    unacclimatised: boolean;
+    vulnerable: boolean;
+    /** 1.0, 1.8, or 3.24. Multiplicative because the two answers are independent. */
+    k_multiplier: number;
+    K: number;
+  };
   ms: number;
 }
 
@@ -260,9 +291,24 @@ export const api = {
   reverse: (lat: number, lon: number, signal?: AbortSignal) =>
     get<ReverseResponse>(`/reverse?lat=${lat}&lon=${lon}`, signal),
   conditions: (signal?: AbortSignal) => get<Conditions>('/conditions', signal),
-  routes: (from: Place, to: Place, signal?: AbortSignal) =>
-    get<RoutesResponse>(
-      `/routes?from_lat=${from.lat}&from_lon=${from.lon}&to_lat=${to.lat}&to_lon=${to.lon}`,
-      signal,
-    ),
+  /** Walking options between two points, priced at the server's wall clock.
+   *
+   * `walker` is the two heat-sensitivity answers. They are sent ONLY when one of them is
+   * set: an untouched dial puts nothing on the query string, so the default request is
+   * byte-identical to the one this app sent before the feature existed, and a response
+   * with `meta.walker.k_multiplier === 1` is provably unpersonalised rather than
+   * personalised back to the default. Nothing about them is stored server-side. */
+  routes: (from: Place, to: Place, walker?: Walker | null, signal?: AbortSignal) => {
+    const p = new URLSearchParams({
+      from_lat: String(from.lat),
+      from_lon: String(from.lon),
+      to_lat: String(to.lat),
+      to_lon: String(to.lon),
+    });
+    if (walker && !isDefault(walker)) {
+      if (walker.unacclimatised) p.set('unacclimatised', 'true');
+      if (walker.vulnerable) p.set('vulnerable', 'true');
+    }
+    return get<RoutesResponse>(`/routes?${p.toString()}`, signal);
+  },
 };

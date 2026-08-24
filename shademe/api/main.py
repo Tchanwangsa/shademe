@@ -1,7 +1,7 @@
 """ShadeMe API. Real-time cool-route options for the Melbourne CBD.
 
 The physics lives in engine/cost/routing/weather/hours; this module is only the surface
-the mobile client talks to. It makes three commitments:
+the mobile client talks to. It makes these commitments:
 
   * REAL TIME, NOT A SCRUBBER. There is no `hour` parameter and no clamp. Every request
     is priced at the wall clock in Australia/Melbourne, all 24 hours of it. A demo that
@@ -10,7 +10,11 @@ the mobile client talks to. It makes three commitments:
     second ladder under the UV objective, and returns the distinct paths that fall out of
     both. Two searches producing the same walk collapse to one option, which is the
     honest answer when there is no better way to go.
-  * NO FIGURE WITHOUT ITS CONFIG. `meta.provenance` rides on every response.
+  * NO FIGURE WITHOUT ITS CONFIG. `meta.provenance` rides on every response, and
+    `meta.walker` says which K the ladder and the recommendation were priced under.
+  * THE LADDER BELONGS TO A PERSON. Two optional flags -- unacclimatised, vulnerable --
+    scale the thermal ladder and pick which option is recommended. They ride on the
+    request and are stored nowhere; see cost.k_multiplier for what they are and are not.
   * ONLY REACHABLE PLACES ARE OFFERED. `/search` geocodes free text against
     OpenStreetMap and then drops every match the walking graph cannot reach, so the
     picker cannot hand `/routes` a destination it will refuse.
@@ -32,7 +36,8 @@ from . import hours
 from . import geocode
 from . import osm_hours
 from .cost import (summarise, segments, thermal_summary, compare_thermal,
-                   uv_summary, compare_uv)
+                   uv_summary, compare_uv, k_multiplier, scale_ladder,
+                   weighted_minutes, K_DEFAULT)
 from ..paths import OUT
 from .. import timegrid as TG
 
@@ -57,8 +62,14 @@ from .. import timegrid as TG
 # and the prewarm thread -- not the first request -- pays for generating it.
 FALLBACK_HOUR = 16          # only for the graph-rebuild path, never for pricing
 
-# The thermal ladder. 0 is "shortest, no preference" (routing.route_utci short-circuits
-# to the plain shortest path) and 0.30 is about as far as the 1.4x detour cap allows.
+# The thermal ladder for a walker who declared nothing. 0 is "shortest, no preference"
+# (routing.route_utci short-circuits to the plain shortest path) and 0.30 is about as far
+# as the 1.4x detour cap allows.
+#
+# THE BASE, NOT THE LADDER WALKED. /routes scales every rung by cost.k_multiplier() for
+# the flags on the request, so a walker who has not adapted to the heat is offered the
+# preferences they actually hold rather than the nearest rung of someone else's. Both
+# ladders are reported: `meta.k_ladder` is what was searched, `meta.k_ladder_base` this.
 K_LADDER = (0.0, 0.03, 0.10, 0.30)
 
 # The UV ladder, walked alongside it. A SECOND OBJECTIVE, not a second tuning of the
@@ -66,6 +77,9 @@ K_LADDER = (0.0, 0.03, 0.10, 0.30)
 # cold clear day when every UTCI on the graph is inside the no-stress band and the thermal
 # ladder collapses to one card. Melbourne sits at UV 3+ for most of the year. K_uv is
 # "how much further to swap full sun for full cover", so 0.40 is already at the cap.
+#
+# NOT SCALED BY THE WALKER'S FLAGS, and cost.k_multiplier says why: neither question asks
+# anything that bears on how much UV a person should collect.
 K_UV_LADDER = (0.10, 0.25, 0.40)
 
 # Two options closer than ALL of these are the same walk to the person doing it, and are
@@ -596,6 +610,32 @@ def label_options(opts, uv_index):
         o["labels"] = labels
 
 
+def recommend(opts, K):
+    """Mark the one option this walker's K prefers. Scores every option either way.
+
+    WHY A RECOMMENDATION AT ALL, in a file whose first commitment is options rather than
+    a pair: because the list was already making the choice, silently. It is sorted
+    coolest-first and the client selects the top card, which is the behaviour of someone
+    who would walk any distance to shed one degree -- K = infinity, asserted nowhere,
+    adjustable by nobody. Scoring the list under a stated K replaces a hidden preference
+    with a declared one, and the list itself does not shrink: every option still ships,
+    still sorted coolest-first, and the recommendation is one flag on one of them.
+
+    THE TIE-BREAK IS THE QUICKER WALK. Options inside SAME_WALK_* of each other have
+    already been merged, so a tie here is two genuinely different walks that price the
+    same, and the one that takes less time is the one to hand someone.
+
+    Nothing is recommended out of a list of one -- there is no choice to make, and a
+    badge on the only card reads as a claim about the walk rather than about the list.
+    """
+    for o in opts:
+        o["weighted_minutes"] = round(weighted_minutes(o["summary"], K), 2)
+        o["recommended"] = False
+    if len(opts) > 1:
+        min(opts, key=lambda o: (o["weighted_minutes"],
+                                 o["summary"]["minutes"]))["recommended"] = True
+
+
 @app.get("/health")
 def health():
     G = S.get("G")
@@ -743,9 +783,29 @@ def get_conditions():
 
 @app.get("/routes")
 def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
-               respect_hours: bool = Query(True)):
-    """Distinct walking options between two points, priced at the current half hour."""
+               respect_hours: bool = Query(True),
+               unacclimatised: bool = Query(
+                   False, description="Has NOT been in heat like this in the past 1-2 "
+                                      "weeks: a visitor, a recent arrival, or anyone in "
+                                      "the first hot week of the season."),
+               vulnerable: bool = Query(
+                   False, description="65+, pregnant, or a heart or kidney condition: "
+                                      "less capacity to shed heat regardless of how long "
+                                      "they have lived in it.")):
+    """Distinct walking options between two points, priced at the current half hour.
+
+    The two flags are the walker, not the weather. They scale the thermal ladder and
+    decide which option comes back `recommended`; everything else -- the physics, the
+    hours gate, the detour cap -- is identical with them and without them. They are read
+    off the query string and stored nowhere: this API holds no per-user state, and the
+    answers live on the device that asked. See cost.k_multiplier.
+    """
     t0 = time.time()
+    mult = k_multiplier(unacclimatised, vulnerable)
+    k_ladder = scale_ladder(K_LADDER, mult)
+    # The one free parameter of the model, as this walker holds it. K_DEFAULT rather than
+    # a rung of the ladder, so the recommendation and the physics share one number.
+    k_walker = round(K_DEFAULT * mult, 4)
     G = S["G"]
     cond, w, h = conditions_block()
     dw = hours.now_dow()
@@ -784,7 +844,7 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
         # Walk both ladders. solve() is cached per slot, so each extra search is one more A*
         # over a warm graph -- a few ms, not a few seconds.
         seen, opts, baseline = {}, [], None
-        searches = ([("thermal", K, routing.route_utci) for K in K_LADDER]
+        searches = ([("thermal", K, routing.route_utci) for K in k_ladder]
                     + [("uv", K, routing.route_uv) for K in K_UV_LADDER])
         for kind, K, fn in searches:
             try:
@@ -881,6 +941,7 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
         # "Balanced" only means something next to something else.
         o["labels"] = o["labels"] or (["Balanced"] if len(opts) > 1 else [])
         o["label"] = o["labels"][0] if o["labels"] else None
+    recommend(opts, k_walker)
     return {
         "conditions": cond,
         "options": opts,
@@ -897,8 +958,15 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
             "rad_source": cond.get("rad_source"),
             "step_min": TG.STEP_MIN,
             "as_of": cond["as_of"],
-            "k_ladder": list(K_LADDER),
+            "k_ladder": list(k_ladder),
+            "k_ladder_base": list(K_LADDER),
             "k_uv_ladder": list(K_UV_LADDER),
+            # WHOSE ROUTE THIS IS. Same role as `provenance` one field down: the
+            # recommendation is a figure like any other, and it is not evidence without
+            # the K that produced it. Echoed back rather than assumed, so a client that
+            # sent nothing can see that nothing was applied.
+            "walker": {"unacclimatised": unacclimatised, "vulnerable": vulnerable,
+                       "k_multiplier": mult, "K": k_walker},
             "uv_index": cond.get("uv_index"),
             "distinct_paths": len(opts),
             "dominated_dropped": dominated,

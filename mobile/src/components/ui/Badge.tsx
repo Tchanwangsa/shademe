@@ -1,7 +1,12 @@
 import { Text, View } from 'react-native';
 import { cn } from '../../lib/cn';
 
-type Tone = 'neutral' | 'sun' | 'shade' | 'indoor';
+/** `pick` is the only FILLED tone, and it is deliberately the shade colour rather than
+ *  a fifth hue: the app has exactly three meaningful colours (sun, shade, indoor) and
+ *  the recommendation is not a fourth state a metre of walking can be in. Filling the
+ *  existing green is a difference in emphasis, which is what "this one" means, instead
+ *  of a new claim. */
+type Tone = 'neutral' | 'sun' | 'shade' | 'indoor' | 'pick';
 
 const TONES: Record<Tone, { box: string; text: string }> = {
   neutral: {
@@ -17,6 +22,7 @@ const TONES: Record<Tone, { box: string; text: string }> = {
     box: 'bg-indoor-bg dark:bg-indoor-fg/30',
     text: 'text-indoor-fg dark:text-indoor-dark',
   },
+  pick: { box: 'bg-shade dark:bg-shade-dark', text: 'text-paper dark:text-night' },
 };
 
 export function Badge({
