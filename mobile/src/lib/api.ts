@@ -1,14 +1,23 @@
 import { API_BASE } from './config';
 
-export type ConditionCode = 'sunny' | 'partly_cloudy' | 'cloudy' | 'drizzle' | 'rain';
-export type OptionLabel = 'Coolest' | 'Balanced' | 'Shortest' | 'Least UV';
+export type ConditionCode =
+  | 'sunny'
+  | 'partly_cloudy'
+  | 'cloudy'
+  | 'drizzle'
+  | 'rain'
+  /** The sun is below the horizon. Decided by the sun's POSITION, never by cloud. */
+  | 'night';
+/** `Coolest` and `Warmest` are the same badge -- least degC-minutes outside the UTCI
+ *  comfort band -- named for the direction the stress actually runs. On a cold night
+ *  the least-stressed walk is the WARM one, and calling it Coolest contradicts the
+ *  cold_stress figure printed beside it. */
+export type OptionLabel = 'Coolest' | 'Warmest' | 'Balanced' | 'Shortest' | 'Least UV';
 export type Objective = 'thermal' | 'uv';
 
 export interface Conditions {
   as_of: string;
   hour: number;
-  /** True when the wall clock fell outside 06:00-20:00 and was pulled into it. */
-  clamped: boolean;
   /** The day actually priced. Today unless SHADEME_SUMMER_DATE pins it. */
   date: string;
   is_today: boolean;
@@ -20,6 +29,13 @@ export interface Conditions {
   uv_source: string;
   uv_index_feed: number | null;
   condition: ConditionCode;
+  /** Which quantity drew the glyph and its value -- the sun's elevation, the beam as a
+   *  fraction of clear sky, or (last resort, and it says so) cloud cover. */
+  condition_source: string;
+  /** Degrees above the horizon at the hour being priced. Null without pvlib. */
+  solar_elevation: number | null;
+  /** Direct radiation over what a clear sky would deliver. Null when unreadable. */
+  beam_fraction: number | null;
   cloud_cover: number;
   precipitation: number;
   wind_speed: number;

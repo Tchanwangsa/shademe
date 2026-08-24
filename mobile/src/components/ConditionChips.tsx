@@ -14,7 +14,9 @@ import { Card } from './ui/Card';
  * thing it says once.
  *
  * No clock either. The engine prices the wall clock and nothing else, so a time readout
- * would only invite the question of whether it can be changed -- it cannot.
+ * would only invite the question of whether it can be changed -- it cannot. That is now
+ * true of every hour: the 06..20 clamp is gone, so the glyph is the sky at THIS hour and
+ * `night` is one of the states it can be.
  */
 export function ConditionChips({ conditions }: { conditions: Conditions | null }) {
   const theme = useTheme();
@@ -23,6 +25,8 @@ export function ConditionChips({ conditions }: { conditions: Conditions | null }
   return (
     <View className="flex-row flex-wrap items-start gap-2">
       <Card className="flex-row items-center gap-2 px-3 py-2">
+        {/* Only the sun is drawn in the sun colour. A gold moon would read as the same
+            state at a glance, which is the confusion this whole chip exists to avoid. */}
         <Ionicons
           name={conditionIcon[conditions.condition] as any}
           size={20}

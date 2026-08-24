@@ -121,7 +121,7 @@ shademe/
   provenance.py       the stamp that says which config produced a number
   physics/            shadow, svf, canopy_svf, surface_temp, mrt  -- pure, no I/O
   pipeline/           fetch -> dsm -> tree_heights -> shade -> materials -> graph
-  api/                main, engine, cost, routing, weather, uv, hours
+  api/                main, engine, cost, routing, weather, sky, uv, hours
 tests/                run directly; exit non-zero on failure
 tools/                benchmarks, source evaluations, sensor validation
 data/                 inputs (mostly fetched; three files are hand-authored)
@@ -174,10 +174,68 @@ Nominatim, per its usage policy), caches for 15 minutes, and sends an identifyin
 User-Agent; the client debounces 300 ms so a search fires per word typed rather than per
 keystroke. Anything past demo traffic should self-host.
 
-The first `/routes` call of the day pays for the surface energy-balance march (~40 s) and
-regenerates the shade set if none matches today's sun (~13 s). Every call after that is
+The first `/routes` call of the day pays for the surface energy-balance march (~45 s) and
+regenerates the shade set if none matches today's sun (~35 s). Every call after that is
 about 100 ms. There is no `hour` parameter, by design: everything is priced at the wall
-clock in Australia/Melbourne, clamped to the 06:00–20:00 window the rasters cover.
+clock in Australia/Melbourne — **all 24 hours of it**, with no clamp.
+
+That used to be a 06:00–20:00 window, because those were the hours a shade set held
+files for, and the wall clock was pulled into it: at 23:53 the app priced 20:00 and
+showed an 8 pm temperature, an 8 pm sky glyph and an arcade gate that thought Melbourne
+Central was open at midnight. Nothing had to be computed to remove it. Below
+`shadow.SUN_MIN_DEG` (5°) every mask in the shadow sweep already returns *fully shaded*,
+so a night raster is the constant 1.0 in all 6.1 M cells — `pipeline.shade` writes no
+file for those hours and `api.engine` reads a missing raster as full shade. The surface
+march has always run the whole 24 h clock internally; it was simply never asked to emit
+the dark hours, and it now streams them onto the edges instead of accumulating them, so
+the extra hours cost no memory either (measured 865 MB peak, against 1153 MB for the
+same march accumulating). A winter set is now *smaller* than the old one: ten files
+instead of fifteen, 234 MB against 350 MB, because five of the old files were already
+the constant 1.0.
+
+### The sky glyph
+
+The chip over the map used to pick its icon with a rule that fell through to cloud cover
+whenever there was no beam to read:
+
+```python
+if direct + diffuse < 20:                    # dusk: no beam to read
+    return "cloudy" if cloud_cover >= 60 else "sunny"
+```
+
+Cloud cover carries no information about whether the sun exists, so that rule cannot tell
+a clear night from a clear dawn — and at 23:53 with 2% cloud it drew a **sun over
+Melbourne at midnight**. `api/sky.py` replaces it with two questions answered from two
+different things:
+
+* **Is the sun up?** From the sun's position, and from nothing else. Below
+  `shadow.SUN_MIN_DEG` the glyph is `night` — the *same* constant the shadow sweep uses
+  to decide every cell is shaded, so the icon and the router cannot disagree about
+  whether there is sun to walk out of.
+* **Is the beam landing?** From beam *transmission* — `direct_radiation` over what a
+  clear sky would deliver at that solar elevation (Haurwitz 1946 for the global,
+  Meinel & Meinel 1976 over a Kasten–Young air mass for the beam). A ratio, not a
+  threshold in W/m², because 100 W/m² of beam is a heavily clouded noon and a perfectly
+  clear 8 am — and the old absolute cut-offs called the second one "partly cloudy".
+
+Checked against Open-Meteo's own clear hours (cloud ≤ 5%, sun above 20°) over two
+seasons of Melbourne archive: mean clear-sky index 1.010 sd 0.055 in summer (n=229) and
+0.946 sd 0.063 in winter (n=42) — a few percent, far tighter than the 0.15 / 0.50 bands
+care about. Every response carries `condition_source` naming the quantity that decided
+and its value, the way `uv_source` does. Cloud cover survives in one clearly-labelled
+branch: the hour in which the sun is up by the wall clock but the radiation row it came
+with covers a window the sun was too low to deliver a readable beam through.
+
+**A caveat found while calibrating this, and it is bigger than the glyph.** Open-Meteo
+returns `utc_offset_seconds: 36000` for a January range as well as an August one — its
+Melbourne timestamps are in a **fixed +10:00 and do not carry AEDT** — and each row is
+the mean over the *preceding* hour. Sweeping the offset against clear hours shows it: the
+two seasons want offsets exactly one hour apart in a DST-aware frame, and the same −30
+min in the fixed frame. Everything else in this project reads row `hh` as "local hour
+hh", which is right to within half an hour in winter and **an hour out in summer**.
+`weather.row_elevation` divides the glyph's beam by the right clear-sky number; it does
+not repair the alignment underneath it, because doing so moves every temperature,
+radiation and UTCI figure here and wants its own validation.
 
 Bind to `0.0.0.0` for a physical phone — `localhost` resolves to the phone itself.
 

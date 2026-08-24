@@ -25,7 +25,10 @@ Resources). You pay this once; the container itself starts in seconds.
 The finished `out/` is ~900 MB before the image prunes the benchmark sets and PNGs.
 
 **Give the container 2 GB.** Measured ~585 MB steady state once the graph and rasters are
-resident, plus the surface-energy march on top of that. Below ~1.5 GB it gets OOM-killed
+resident, plus the surface-energy march on top of that -- 865 MB peak RSS through the
+march, unchanged by the move from a 15-hour window to the full 24-hour clock because
+`engine.attach_tsurf` streams each hour onto the edges instead of accumulating the
+rasters. Below ~1.5 GB it gets OOM-killed
 partway through a route, which looks like a random 502 rather than an obvious crash.
 
 **Overpass rate-limits.** If the build dies in `fetch_osm` or `materials`, that is
