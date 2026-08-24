@@ -27,6 +27,17 @@ RAY_STEP = 0.25
 # only so tools/bench_shade_ladder.py can rebuild the older rungs from these same lines.
 BEAM = "hypot"
 
+# Below this solar elevation the sweep is not run at all: the ray walk is 1/tan(el) cells
+# long, so it degenerates, and a beam that grazes in at 4 degrees is intercepted by
+# something in a city block anyway. Every mask below returns "fully shaded" under it, so
+# the raster for such an hour is the constant 1.0 and is not worth writing to disk --
+# pipeline.shade skips it and api.engine reads a MISSING RASTER AS FULL SHADE.
+#
+# It is exported because it is the one definition of "the sun is up" this project has.
+# api.sky draws the night glyph from the same number, so the icon and the router can
+# never disagree about whether there is a beam to walk out of.
+SUN_MIN_DEG = 5.0
+
 
 def sun_position(when, lat=-37.8136, lon=144.9631):
     """when: tz-aware pandas Timestamp. Returns (azimuth_deg, elevation_deg)."""
@@ -58,7 +69,7 @@ def _beam_h(dr, dc, k, cell, tan_el, beam=BEAM):
 
 def shadow_mask(dsm, cell, az_deg, el_deg, max_h=None, step=RAY_STEP, beam=BEAM):
     """True where ground is shadowed. Grid: row 0 = north, col 0 = west."""
-    if el_deg < 5.0:
+    if el_deg < SUN_MIN_DEG:
         return np.ones(dsm.shape, dtype=bool)      # sun too low: all shadow
     az, el = np.radians(az_deg), np.radians(el_deg)
     tan_el = np.tan(el)
@@ -87,7 +98,7 @@ def canopy_mask(top_c, base_c, cell, az_deg, el_deg, step=RAY_STEP, beam=BEAM):
     the lower test is vacuous and this degenerates to a horizon test on the crown tops.
     """
     out = np.zeros(top_c.shape, dtype=bool)
-    if el_deg < 5.0:
+    if el_deg < SUN_MIN_DEG:
         return out
     az, el = np.radians(az_deg), np.radians(el_deg)
     tan_el = np.tan(el)
@@ -143,7 +154,7 @@ def point_shade(dsm_b, dsm_c, dsm_c_base, cell, az_deg, el_deg, rows, cols, z0,
     cols = np.asarray(cols, dtype=np.int64)
     z0 = np.asarray(z0, dtype=np.float32)
     H, W = dsm_b.shape
-    if el_deg < 5.0:
+    if el_deg < SUN_MIN_DEG:
         return np.ones(rows.shape, dtype=np.float32)
 
     az, el = np.radians(az_deg), np.radians(el_deg)

@@ -31,6 +31,7 @@ export const conditionIcon: Record<ConditionCode, string> = {
   cloudy: 'cloudy',
   drizzle: 'rainy-outline',
   rain: 'rainy',
+  night: 'moon',
 };
 
 /** UV dose over a walk, in index-minutes. The UV analogue of `dose`. */

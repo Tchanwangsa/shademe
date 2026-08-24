@@ -4,11 +4,13 @@ import { cn } from '../lib/cn';
 import { distance, dose, minutes, pct, seconds, uvDose } from '../lib/format';
 import { Badge } from './ui/Badge';
 
-/** How each earned label renders. `Least UV` and `Coolest` are the two things the engine
- * actually optimised for, so they get colour; `Shortest` and `Balanced` are statements of
- * fact about the route and stay plain. */
+/** How each earned label renders. `Least UV` and the comfort badge are the two things
+ * the engine actually optimised for, so they get colour; `Shortest` and `Balanced` are
+ * statements of fact about the route and stay plain. `Warmest` is the same badge as
+ * `Coolest` pointing the other way -- see OptionLabel -- so it renders identically. */
 const LABEL_TONE: Record<OptionLabel, 'shade' | 'indoor' | null> = {
   Coolest: 'shade',
+  Warmest: 'shade',
   'Least UV': 'indoor',
   Shortest: null,
   Balanced: null,

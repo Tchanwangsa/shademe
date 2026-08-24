@@ -1,16 +1,24 @@
-"""Checks for the half-hour time grid: the window, the clamp, and dt invariance.
+"""Checks for the half-hour time grid: the sun gate, the clock, and dt invariance.
 
 Run: python tests/test_timegrid.py
 
-The expensive one is (a): it re-derives the 06-20 window from pvlib over every hour of a
-year rather than trusting the constant, because that window is an assertion about the sun
-and the only way it stays true is by being checked against the sun.
+The expensive one is (a). There USED to be a 06:00-20:00 window here and this test
+re-derived it from pvlib over every hour of a year. The window is gone -- what decides
+whether a slot has a raster is now shadow.SUN_MIN_DEG on the day being priced -- so (a)
+checks the claim that replaced it, and checks it the same way: over all 17,520 half-hour
+slots of 2026, from pvlib, rather than trusting the numbers quoted in the README.
+
+The claim is that widening to 24 h COSTS NOTHING. That is only true because the sun gate
+is a strict subset of the window it replaced, and that is a fact about the sun which
+nothing in the code enforces -- so it is checked against the sun.
 """
 import numpy as np
 import pandas as pd
 import pvlib
 
 from shademe import timegrid as TG
+from shademe.physics import shadow
+from shademe.physics.shadow import SUN_MIN_DEG
 from shademe.physics import surface_temp as st
 from shademe.api import cost
 from shademe.api.weather import _interp_hourly as _interp
@@ -25,22 +33,39 @@ def check(name, ok, msg=""):
         FAIL.append(name)
 
 
-print("\n(a) the window is exactly the hours the sun can be up, over a whole year")
-idx = pd.date_range("2026-01-01", "2026-12-31 23:00", freq="h", tz=TZ)
+print("\n(a) the sun gate is a strict subset of the window it replaced, all year")
+OLD_FIRST, OLD_LAST, OLD_N = 6 * 60, 20 * 60, 29     # the window this test used to assert
+idx = pd.date_range("2026-01-01", "2026-12-31 23:30", freq=f"{TG.STEP_MIN}min", tz=TZ)
 el = pvlib.solarposition.get_solarposition(idx, LAT, LON)["apparent_elevation"].values
-lit = sorted({h for h, e in zip(idx.hour, el) if e > 0})
-check("every hour with sun is inside the window",
-      all(TG.FIRST_MIN <= h * 60 <= TG.LAST_MIN for h in lit), f"lit hours {lit[0]}..{lit[-1]}")
-check("no hour inside the window is dark all year",
-      set(lit) == set(range(TG.FIRST_MIN // 60, TG.LAST_MIN // 60 + 1)),
-      f"{len(lit)} lit hours vs {TG.LAST_MIN // 60 - TG.FIRST_MIN // 60 + 1} in window")
-for h in (TG.FIRST_MIN // 60 - 1, TG.LAST_MIN // 60 + 1):
-    hi = max(e for hh, e in zip(idx.hour, el) if hh == h)
-    check(f"{h:02d}:00 is below the horizon on all 365 days", hi <= 0.0,
-          f"max elevation {hi:.2f} deg")
+minute = idx.hour * 60 + idx.minute
+lit = minute[el >= SUN_MIN_DEG]
+
+check("every slot the sweep can resolve is inside the old window",
+      lit.min() >= OLD_FIRST and lit.max() <= OLD_LAST,
+      f"sunlit slots span {TG.label(lit.min())}..{TG.label(lit.max())}")
+# The one that matters for disk: per DAY, never more files than the window wrote.
+per_day = pd.Series(el >= SUN_MIN_DEG, index=idx).groupby(idx.date).sum()
+check("no day needs more rasters than the old window wrote",
+      per_day.max() <= OLD_N, f"worst day {per_day.max()} vs {OLD_N}")
+check("and most days need far fewer",
+      per_day.mean() < OLD_N - 4, f"mean {per_day.mean():.1f} rasters/day vs {OLD_N}")
+# The four days quoted in the README and in pipeline.shade's header.
+for day, want in (("2026-06-21", 17), ("2026-08-24", 20),
+                  ("2026-01-26", 27), ("2026-12-21", 28)):
+    got = int(per_day[pd.Timestamp(day).date()])
+    check(f"{day} needs {want} rasters", got == want, f"got {got}")
+# The gate is the SWEEP's, not a second copy of it. If shadow.SUN_MIN_DEG moves, the set
+# on disk moves with it and this test is the thing that notices.
+check("the gate is shadow.SUN_MIN_DEG itself", SUN_MIN_DEG == 5.0, f"{SUN_MIN_DEG}")
+check("a slot below the gate is fully shaded by the sweep",
+      bool(shadow.shadow_mask(np.zeros((4, 4), np.float32), 2.0, 0.0,
+                              SUN_MIN_DEG - 0.1).all()))
 
 print("\n(b) slots, labels and the as_slot ambiguity")
-check("29 slots at 30 min", len(TG.SLOTS) == 29 and TG.STEP_MIN == 30)
+check("48 slots at 30 min -- the whole clock",
+      len(TG.SLOTS) == 48 and TG.STEP_MIN == 30 and TG.SLOTS[0] == 0,
+      f"{len(TG.SLOTS)} slots, first {TG.label(TG.SLOTS[0])}")
+check("SLOTS and the march CLOCK are one list", TG.CLOCK is TG.SLOTS)
 check("hhmm sorts lexically in a directory",
       [TG.hhmm(s) for s in TG.SLOTS] == sorted(TG.hhmm(s) for s in TG.SLOTS))
 check("as_slot reads an int hour as an hour", TG.as_slot(13) == 780)
@@ -48,18 +73,21 @@ check("as_slot passes a slot through", TG.as_slot(810) == 810)
 check("as_slot parses HH:MM", TG.as_slot("13:30") == 810)
 check("label round-trips", all(TG.as_slot(TG.label(s)) == s for s in TG.SLOTS))
 
-print("\n(c) the clamp snaps to the NEAREST slot and reports the window honestly")
-cases = [(13 * 60 + 52, 840, True), (13 * 60 + 44, 810, True),
-         (1 * 60 + 37, TG.FIRST_MIN, False), (21 * 60 + 30, TG.LAST_MIN, False),
-         (20 * 60 + 10, TG.LAST_MIN, True), (5 * 60 + 50, TG.FIRST_MIN, True)]
-for minute, want, lit_want in cases:
-    raw = TG.snap(minute)
-    got, in_win = TG.clamp(raw), TG.in_window(raw)
-    check(f"{minute // 60:02d}:{minute % 60:02d} -> {TG.label(got)}, sun up={in_win}",
-          got == want and in_win == lit_want,
-          f"got {TG.label(got)} lit={in_win}")
+print("\n(c) snapping is to the NEAREST slot, wraps at midnight, and never clamps")
+cases = [(13 * 60 + 52, 840), (13 * 60 + 44, 810),
+         (1 * 60 + 37, 90),                        # 01:37 -> 01:30. Used to clamp to 06:00.
+         (21 * 60 + 30, 1290),                     # 21:30 -> itself. Used to clamp to 20:00.
+         (23 * 60 + 50, 0),                        # wraps, rather than running off the end
+         (5 * 60 + 50, 360)]
+for m, want in cases:
+    got = TG.snap(m)
+    check(f"{m // 60:02d}:{m % 60:02d} -> {TG.label(want)}", got == want,
+          f"got {TG.label(got)}")
+check("every snap lands on a real slot", all(TG.snap(m) in TG.SLOTS for m in range(1440)))
 check("nearest never rounds more than half a step away",
-      max(abs(TG.snap(m) - m) for m in range(0, 1440)) <= TG.STEP_MIN // 2)
+      max(min(abs(TG.snap(m) - m), 1440 - abs(TG.snap(m) - m))
+          for m in range(0, 1440)) <= TG.STEP_MIN // 2)
+check("the clamp is gone", not hasattr(TG, "clamp") and not hasattr(TG, "in_window"))
 
 print("\n(d) dt does NOT change when the clock is refined -- the whole point")
 # The finer clock is built the way production builds it: weather._interp_hourly, i.e.

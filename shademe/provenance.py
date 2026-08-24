@@ -77,10 +77,10 @@ def _git():
 def stamp(mode="summer", hours=None):
     """Everything a reported figure depends on. Safe to call from anywhere.
 
-    `hours` is the timegrid slot list by default. It is stamped alongside `step_min`
-    because the grid is itself an input: the same day marched hourly and marched at 30
-    minutes gives different numbers, and a figure carrying only a set digest could not
-    tell the two apart.
+    `hours` is the timegrid slot list by default -- the WHOLE clock, so a stamp covers
+    the dark slots too. It is stamped alongside `step_min` because the grid is itself an
+    input: the same day marched hourly and marched at 30 minutes gives different numbers,
+    and a figure carrying only a set digest could not tell the two apart.
     """
     cache = _cache_load()
     from . import timegrid as TG
@@ -118,7 +118,9 @@ def stamp(mode="summer", hours=None):
         paths = [_shade_path(h, mode) for h in hours]
         shade_day = _raster_day(mode)
         from .api.engine import _set_step
-        set_step = _set_step(os.path.relpath(os.path.dirname(paths[0]), OUT))
+        # The first path with a raster, not paths[0]: slot 0 is midnight and has none.
+        _first = next(p for p in paths if p)
+        set_step = _set_step(os.path.relpath(os.path.dirname(_first), OUT))
     except Exception:
         paths = [f"{OUT}/shade_{TG.hhmm(h)}.npy" for h in hours]
         _svf_path = lambda: (f"{OUT}/svf_veg.npy" if os.path.exists(f"{OUT}/svf_veg.npy")
@@ -127,23 +129,34 @@ def stamp(mode="summer", hours=None):
         set_step
     except NameError:
         set_step = None
-    digs = [sha(p, cache) for p in paths]
-    dirs = sorted({os.path.relpath(os.path.dirname(p), OUT) for p in paths})
-    # The DAY the shadows were cast for, distinct from demo_day below: the set is chosen
-    # from the date being priced, so a stamp naming only the demo day would read
-    # "shade v2_winter ... day 2026-01-26" and invite the wrong conclusion.
+    # A None path is a slot with the sun below SUN_MIN_DEG: no raster is written for it
+    # and the engine prices it as full shade. Stamped as "night" rather than skipped -- a
+    # set that stops at 20:00 and one that stops at 17:00 are different sets, and the
+    # stamp has to be able to say which was read.
+    digs = [None if p is None else sha(p, cache) for p in paths]
+    dirs = sorted({os.path.relpath(os.path.dirname(p), OUT) for p in paths if p})
+    lit = [h for h, p in zip(hours, paths) if p]
     s["shade"] = {"dir": "/".join(d if d != "." else "out" for d in dirs),
+                  # The DAY the shadows were cast for, distinct from demo_day below: the
+                  # set is chosen from the date being priced, so a stamp naming only the
+                  # demo day would read "shade v2_winter ... day 2026-01-26" and invite
+                  # the wrong conclusion.
                   "day": shade_day,
-                  "window": [TG.label(hours[0]), TG.label(hours[-1])],
+                  # The SUNLIT span, which is a property of the DAY and not of a
+                  # configured window -- there is no window any more. Two sets for two
+                  # different days legitimately carry different spans.
+                  "window": ([TG.label(lit[0]), TG.label(lit[-1])] if lit else []),
+                  "night_slots": [h for h, p in zip(hours, paths) if p is None],
                   # TWO STEPS, ON PURPOSE. `step_min` is the grid this run asked for;
                   # `set_step_min` is what the rasters it actually resolved were built at.
                   # They differ when a pre-slot set is being served through _shade_path's
                   # containing-hour fallback, and a figure quoted off that is quoted off
                   # hourly shadows however finely the rest of the run was clocked.
                   "step_min": TG.STEP_MIN, "set_step_min": set_step,
-                  "n_slots": len(hours),
-                  "set_sha": _rollup(digs),
-                  "files": {TG.hhmm(h): d for h, d in zip(hours, digs)}}
+                  "n_slots": len(hours), "n_sunlit": len(lit),
+                  "set_sha": _rollup([d for d in digs if d]),
+                  "files": {TG.hhmm(h): (d or "night")
+                            for h, d in zip(hours, digs)}}
     svf = _svf_path()
     s["svf"] = {"path": os.path.relpath(svf, ROOT) if svf else None,
                 "sha": sha(svf, cache) if svf else None}
@@ -207,11 +220,17 @@ def stamp(mode="summer", hours=None):
 
 
 def _step_note(sh):
-    """' @30min', or a loud note when the rasters are coarser than the grid asked for."""
+    """' @30min, 27 sunlit', or a loud note when the rasters are coarser than asked.
+
+    The sunlit count is part of the identity of a set now that there is no window: two
+    sets at the same step for two different days hold different numbers of rasters, and
+    that is the day, not a half-finished run.
+    """
     want, got = sh.get("step_min", 60), sh.get("set_step_min")
+    lit = f", {sh['n_sunlit']} sunlit" if sh.get("n_sunlit") is not None else ""
     if got is None or got == want:
-        return f" @{want}min"
-    return f" @{got}min RASTERS, {want}min GRID -- served through the hourly fallback"
+        return f" @{want}min{lit}"
+    return f" @{got}min RASTERS, {want}min GRID{lit} -- served through the hourly fallback"
 
 
 def line(s=None, **kw):

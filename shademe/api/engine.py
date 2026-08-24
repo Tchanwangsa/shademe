@@ -24,7 +24,26 @@ PHYSICS_SRC = ("surface_temp.py", "mrt.py", "shadow.py")
 PHYSICS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "physics"))
 # The time grid is timegrid's, not this module's: the generator, the march and the router
 # have to agree on it exactly, and one of them owning the list is how that stays true.
+#
+# THE WHOLE CLOCK, at that grid's step. This was 06:00..20:00 -- the slots a shade set had
+# files for -- and the API clamped the wall clock into it. The rasters were never the
+# reason: below shadow.SUN_MIN_DEG every mask in the sweep returns "fully shaded", so a
+# night raster is the constant 1.0 and pipeline.shade does not write one. _shade_path()
+# returns None for those slots and every reader below treats that as FULL SHADE, which is
+# what it is.
+#
+# Widening to 24 h costs NOTHING and saves in every season, because the sun gate is a
+# strict subset of the window it replaces: 17 (June) to 28 (December) half-hour rasters
+# where the window wrote 29 regardless. An old set built only for 06:00..20:00 -- or a
+# pre-slot hourly one -- keeps working unchanged, since the slots outside it have no file,
+# which is the same statement as "the sun is down". Nothing has to be regenerated to route
+# at 3am. See timegrid for the measured table.
 SLOTS = TG.SLOTS
+
+# Probe slot for "does this directory hold a shade set". Must be one the sun is up for on
+# every day of the year, since the dark slots legitimately have no file: 13:00 local is
+# above 27 deg in Melbourne even at the winter solstice.
+PROBE_SLOT = 13 * 60
 TZ = "Australia/Melbourne"
 N_SAMPLE = 8
 
@@ -87,9 +106,7 @@ def _sets_on_disk():
         except (ValueError, OSError):
             continue
         day, step = m.get("day"), int(m.get("step_min") or 60)
-        first = os.path.join(OUT, d, f"shade_{TG.hhmm(SLOTS[0])}.npy")
-        legacy = os.path.join(OUT, d, f"shade_{TG.hour_of(SLOTS[0]):02d}.npy")
-        if day and (os.path.exists(first) or os.path.exists(legacy)):
+        if day and _has_probe(d):
             out[d] = (day, step)
     return out
 
@@ -150,7 +167,7 @@ def ensure_shade_set(day):
               f"generation disabled -- using it anyway")
         return d
     name = f"{GEN_PREFIX}{day}"
-    if os.path.exists(os.path.join(OUT, name, f"shade_{TG.hhmm(SLOTS[-1])}.npy")):
+    if _has_probe(name):
         return name
     why = (f"{gap:.1f} deg off at noon" if gap > SHADE_TOL_DEG
            else f"hourly, and this request needs {TG.STEP_MIN} min")
@@ -177,15 +194,43 @@ def _dirs_for(mode):
     return SHADE_DIRS.get(mode, SHADE_DIRS["summer"])
 
 
-def _shade_path(slot, mode="summer"):
-    """Raster for one slot. Falls back to the containing hour on a pre-slot set.
+def _has_probe(d):
+    """Does directory `d` hold a raster for PROBE_SLOT, under either naming?
 
-    The fallback exists so a checkout whose out/ was built before the half-hour grid still
-    runs instead of crashing on a missing file. It is not a silent downgrade: a set that
-    only has whole hours fails the step test in ensure_shade_set() and is regenerated, so
-    this is reached only when generation is off or has failed, which prints.
+    Probing a MIDDAY slot rather than the first one, because the first slot of the clock
+    is 00:00 and no set has a file for it -- the dark slots legitimately have none. Both
+    namings are accepted so a pre-slot hourly set still registers as a set.
     """
+    for n in (f"shade_{TG.hhmm(PROBE_SLOT)}.npy",
+              f"shade_{TG.hour_of(PROBE_SLOT):02d}.npy"):
+        if os.path.exists(os.path.join(OUT, d, n)):
+            return True
+    return False
+
+
+def _shade_path(slot, mode="summer"):
+    """The raster for one slot, or None when there is none -- meaning FULL SHADE.
+
+    None is a real answer, not a failure: the sun is below SUN_MIN_DEG for the dark half
+    of the clock and pipeline.shade deliberately writes no file for those slots. Callers
+    substitute 1.0.
+
+    A missing file with the sun UP is a different thing entirely -- a half-built set --
+    and is reported rather than silently priced as a shaded street.
+
+    The whole-hour fallback exists so a checkout whose out/ was built before the half-hour
+    grid still runs instead of crashing on a missing file. It is not a silent downgrade: a
+    set that only has whole hours fails the step test in ensure_shade_set() and is
+    regenerated, so it is reached only when generation is off or has failed, which prints.
+    """
+    # THE SUN DECIDES FIRST, THE DISK SECOND, and that order is not cosmetic. The
+    # directory chain ends in the January set as a last resort, so asking the disk first
+    # answered "is 07:00 dark on 24 August?" with out/v2/shade_07.npy -- a SUMMER DAWN
+    # raster stood in for a winter night, which is the one substitution the shade-set
+    # machinery above exists to prevent. Below SUN_MIN_DEG there is no file to look for.
     slot = int(slot)
+    if not _sun_up(_shade_day(mode), slot):
+        return None
     names = [f"shade_{TG.hhmm(slot)}.npy",                  # this slot
              f"shade_{TG.hour_of(slot):02d}.npy"]           # the containing hour, coarse
     for d in _dirs_for(mode):
@@ -193,7 +238,46 @@ def _shade_path(slot, mode="summer"):
             p = os.path.join(OUT, d, n) if d else f"{OUT}/{n}"
             if os.path.exists(p):
                 return p
-    return f"{OUT}/{names[-1]}"
+    print(f"[shade] MISSING shade_{TG.hhmm(slot)}.npy for {mode} with the sun up "
+          f"-- that slot will be priced as fully shaded")
+    return None
+
+
+def _shade_day(mode):
+    """The day whose sunrise and sunset decide which slots have rasters.
+
+    The day BEING PRICED when one was given, not the day the closest set on disk was
+    generated for: whether the sun is up is a fact about today, and the set is only ever
+    within SHADE_TOL_DEG of today anyway.
+    """
+    if isinstance(mode, str) and _DATE_RE.match(mode):
+        return mode
+    return _raster_day(mode)
+
+
+_SUN_UP = {}
+
+
+def _sun_up(day, slot):
+    """Is the sun high enough at `day slot` for the shadow sweep to resolve anything?
+
+    The SAME test the sweep makes (shadow.SUN_MIN_DEG), so "there is no raster" and
+    "there is no beam" are one statement rather than two that can drift apart.
+
+    Memoised because _shade_path is called once per slot per index build and the halved
+    step doubled that: 48 pvlib calls per graph load, all for the same handful of days.
+    """
+    key = (day, int(slot))
+    if key in _SUN_UP:
+        return _SUN_UP[key]
+    from ..physics.shadow import SUN_MIN_DEG
+    try:
+        el = sun_position(pd.Timestamp(f"{day} {TG.label(slot)}", tz=TZ))[1]
+        got = bool(el >= SUN_MIN_DEG)
+    except Exception:
+        got = True                               # cannot tell -> treat a gap as a fault
+    _SUN_UP[key] = got
+    return got
 
 
 # Which SVF raster the engine reads. svf_veg is svf_bldg with the canopy's TRUE
@@ -301,7 +385,11 @@ def edge_index(G, mode="summer"):
         "shade": np.zeros((len(SLOTS), n), dtype=np.float32),
     }
     for i, sl in enumerate(SLOTS):
-        E["shade"][i] = take(np.load(_shade_path(sl, mode), mmap_mode="r"))
+        p = _shade_path(sl, mode)
+        # No raster = the sun is down = every edge fully shaded. Not loaded, not stored
+        # as a raster, and not a special case anywhere downstream: 1.0 is the same
+        # number the sweep would have written into every cell of a night file.
+        E["shade"][i] = 1.0 if p is None else take(np.load(p, mmap_mode="r"))
     _apply_decks(G, edges, E, g, mode)
     svf_p = _svf_path()
     if svf_p:
@@ -319,7 +407,13 @@ def edge_index(G, mode="summer"):
 
 
 def _file_sig(path):
-    """(size, mtime) signature, cheap and enough to spot a regenerated raster."""
+    """(size, mtime) signature, cheap and enough to spot a regenerated raster.
+
+    None for a path that is None -- a dark hour has no raster, and "no file" is a
+    perfectly good cache key for it.
+    """
+    if path is None:
+        return None
     try:
         st = os.stat(path); return [st.st_size, int(st.st_mtime)]
     except OSError:
@@ -369,31 +463,53 @@ def _clock(wx):
     return _w.slot_rows(wx)
 
 
-def surface_temps(wx, g, cache=None, mode="summer"):
+def surface_temps(wx, g, cache=None, mode="summer", on_slot=None):
     """{slot: Ts raster (K)} for the whole grid. The march is ~38 s.
 
     Half-hourly now, and that costs no march time: the clock's step halved but
     surface_temp.SUB_DT holds the integration at dt=300 s either way, so this walks the
     same number of substeps and integrates the same accumulation. What doubles is the
-    number of rasters EMITTED -- 29 instead of 15, ~700 MB if kept -- which is why the
-    edge cache in attach_tsurf() is the one that ships and this one stays opt-in.
+    number of rasters EMITTED.
+
+    `on_slot(slot, ts)` streams instead: each slot is handed over as it is reached and NOT
+    accumulated, and the return is empty. That is the mode attach_tsurf uses, and it is
+    what makes this grid fit the box. A Ts raster is 24.2 MB on the real grid and the
+    router never reads one -- it reads 8 samples along each edge -- so holding all 48 is
+    1.16 GB spent to be thrown away immediately. Streaming the 24 h clock hourly measured
+    865 MB peak RSS against 1153 MB accumulating; at this step the accumulating figure is
+    the one that would not fit the 2 GB container at all. See surface_temp.march on peak
+    RAM.
+
+    Every slot needs a Ts, dark ones included: the accumulation integral is the only part
+    of this model with memory, so the night is what the morning is warm from. It is the
+    SHADE rasters the dark slots do without, not the surface temperatures.
     """
     cache = RASTER_CACHE if cache is None else cache
     key = _key(wx["hours"], wx.get("date", "?"), mode)
     path = f"{OUT}/tsurf_cache_{key}.npz"
     if cache and os.path.exists(path):
         z = np.load(path)
+        if on_slot is not None:
+            for k in z.files:
+                on_slot(int(k), z[k])
+            return {}
         return {int(k): z[k] for k in z.files}
     _sp = _svf_path()
     svf = (np.load(_sp) if _sp else np.ones((g["h"], g["w"]), dtype=np.float32))
     mat = (np.load(f"{OUT}/material_id.npy") if os.path.exists(f"{OUT}/material_id.npy")
            else np.zeros((g["h"], g["w"]), dtype=np.uint8))
     props = json.load(open(f"{OUT}/material_props.json"))
-    shade = {sl: np.load(_shade_path(sl, mode), mmap_mode="r") for sl in SLOTS}
-    ts = ST.march(shade, svf, mat, props, _clock(wx), hours=SLOTS, keep=True)
+    # Only the slots with a raster. march() fills the rest with DEFAULT_SHADE = 1.0,
+    # which is exactly right for them and is why the dark half of the clock needs no
+    # files: see _shade_path.
+    shade = {sl: np.load(p, mmap_mode="r") for sl, p in
+             ((sl, _shade_path(sl, mode)) for sl in SLOTS) if p is not None}
+    keep = cache or on_slot is None
+    ts = ST.march(shade, svf, mat, props, _clock(wx), hours=SLOTS,
+                  keep=keep, on_hour=on_slot)
     if cache:
         np.savez_compressed(path, **{str(k): v for k, v in ts.items()})
-    return ts
+    return ts if on_slot is None else {}
 
 
 def _props_vec(props, key, default):
@@ -531,17 +647,22 @@ def attach_tsurf(E, G, wx, g=None, mode="summer", cache=True):
         E["tsurf_k"] = {int(k): z[k].astype(np.float64) for k in z.files}
         _attach_walls(E, wx, mode)
         return E["tsurf_k"]
-    ts = surface_temps(wx, g, mode=mode)
     take = _sampler(G, E["edges"], g)
     rows = _clock(wx)
     E["tsurf_k"] = {}
-    for h in SLOTS:
-        v = take(ts[h]).astype(np.float64)
-        row = rows.get(h) or {}
+
+    def sample(sl, ts_sl):
+        """8 samples per edge, then the raster is dropped. See surface_temps(on_slot)."""
+        v = take(ts_sl).astype(np.float64)
+        row = rows.get(sl) or rows.get(str(sl)) or {}
         ta = float(row.get("temperature_2m") or 20.0)
-        v = np.where(E["indoor"], INDOOR_TA + 273.15,
-                     np.where(E["covered"], ta + 273.15, v))
-        E["tsurf_k"][h] = v
+        E["tsurf_k"][sl] = np.where(E["indoor"], INDOOR_TA + 273.15,
+                                    np.where(E["covered"], ta + 273.15, v))
+
+    surface_temps(wx, g, mode=mode, on_slot=sample)
+    missing = [sl for sl in SLOTS if sl not in E["tsurf_k"]]
+    if missing:
+        raise RuntimeError(f"surface march emitted no Ts for slots {missing}")
     if cache:
         np.savez_compressed(path, **{str(k): v.astype(np.float32)
                                      for k, v in E["tsurf_k"].items()})

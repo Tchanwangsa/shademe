@@ -5,33 +5,55 @@ ONE UNIT, EVERYWHERE. A slot is an int -- minutes since local midnight -- so 06:
 survives a json round-trip as "6.5"), not a (h, m) pair, and not an index into a list
 that every caller has to hold the same copy of.
 
-WHY 06:00-20:00 AND NOT WIDER. Measured over all 8760 hours of 2026 at -37.8136,
-144.9631: the sun's apparent elevation never exceeds -9.20 deg at 05:00 or -3.26 deg at
-21:00, and it is above the horizon at some point of the year in every hour from 06 to 20.
-So this window is exactly the set of hours that can carry a beam, not a cautious guess.
-Outside it there is no direct radiation to route around and api.main zeroes the beam
-rather than borrowing the last daylight hour's.
+THE WHOLE CLOCK, AND NO WINDOW. This was 06:00-20:00, justified as "exactly the set of
+hours that can carry a beam somewhere in the year", and api.main clamped the wall clock
+into it. The window was the wrong shape of answer to the right question. What actually
+decides whether a slot has a raster is whether the sun is up ON THE DAY BEING PRICED,
+which is `shadow.SUN_MIN_DEG` -- the same 5 deg the shadow sweep itself uses to give up
+and call every cell shaded. Below it there is no beam to route around, the raster would
+be the constant 1.0 in all 6.1 M cells, so pipeline.shade writes no file and
+api.engine._shade_path reads the absence as full shade.
+
+That gate is a STRICT SUBSET of the old window on every day of the year, so covering the
+whole clock costs nothing and saves in every season -- measured at this latitude:
+
+    day           sunlit half-hour slots    the old 06:00-20:00 window
+    2026-06-21     17  (08:30..16:30)        29
+    2026-08-24     20  (07:30..17:00)        29
+    2026-01-26     27  (07:00..20:00)        29
+    2026-12-21     28  (06:30..20:00)        29
+
+A winter set is now smaller than the hourly set that preceded it. What the window cost
+was not disk, it was correctness at the edges: 23:53 was priced on 20:00's sun, with an
+8pm temperature, an 8pm sky glyph and an arcade gate that thought Melbourne Central was
+open at midnight. There is no clamp here any more because there is nothing to clamp to.
 
 WHY 30 MINUTES. At solar noon in January the solar azimuth swings 23.4 deg in half an
 hour, so an hourly grid is up to 30 minutes stale at its worst point. Against a rebuilt
 13:30 raster, nearest-hour sampling put 2.9% (Jan) to 3.8% (Aug) of cells on the wrong
 side of a shadow edge; halving the step halves that. 15 minutes was measured too and
-does not pay for itself: it quadruples the raster set to 1.3 GB per day for a further
-fraction of a percent. The radiation series IS sampled at 15 minutes, because that costs
-no disk at all -- see api.weather.
+does not pay for itself: it quadruples the raster set for a further fraction of a
+percent. The radiation series IS sampled at 15 minutes, because that costs no disk at
+all -- see api.weather.
 
 The march in physics.surface_temp derives its timestep from the spacing of the clock it
 is handed, so moving to half-hour slots keeps dt at 300 s and does not change the
-accumulation integral. The Ts numbers are comparable across this change; the shade ones
+accumulation integral. The Ts numbers are comparable across that change; the shade ones
 are not, because the rasters are new.
+
+A Ts raster is 24.2 MB on the real grid and the march has to produce one for EVERY slot,
+dark ones included -- the accumulation integral is the only part of the model with
+memory, so the night is what the morning is warm from. 48 of them held at once is 1.16
+GB, which is why api.engine.attach_tsurf streams them onto the edges instead of
+accumulating: it is what makes this grid fit the box at all.
 """
 STEP_MIN = 30
-FIRST_MIN, LAST_MIN = 6 * 60, 20 * 60        # 06:00, 20:00 -- see the docstring
-SLOTS = list(range(FIRST_MIN, LAST_MIN + 1, STEP_MIN))
 
-# The full 24 h clock the energy-balance march walks, at the same step. The march needs
-# the whole diurnal cycle to accumulate; SLOTS is only what gets emitted from it.
-CLOCK = list(range(0, 24 * 60, STEP_MIN))
+# Every slot of the day. The march clock and the priced grid are now the same list --
+# they were two lists while the window existed, and the march always walked the full 24 h
+# anyway to accumulate, so the window only ever decided what got emitted from it.
+SLOTS = list(range(0, 24 * 60, STEP_MIN))
+CLOCK = SLOTS                    # the old name for the march's clock; they are one grid
 
 # 15 minutes, for the radiation series only. Open-Meteo's minutely_15 carries real
 # sub-hourly structure in direct/diffuse radiation (a cloud crossing reads 267 -> 208 ->
@@ -61,23 +83,18 @@ def is_hour(slot):
 
 
 def of(when):
-    """A datetime -> the minute-of-day it falls on. Not snapped, not clamped."""
+    """A datetime -> the minute-of-day it falls on. Not snapped."""
     return when.hour * 60 + when.minute
 
 
 def snap(minute, step=STEP_MIN):
-    """Round a minute-of-day to the NEAREST slot. Unclamped: 1290 -> 1290 (21:30)."""
-    return int(round(float(minute) / step) * step)
+    """Round a minute-of-day to the NEAREST slot, wrapping at midnight.
 
-
-def clamp(minute):
-    """Hold a minute-of-day inside the daylight window."""
-    return max(FIRST_MIN, min(LAST_MIN, int(minute)))
-
-
-def in_window(minute):
-    """Is there any sun to route around at this minute-of-day? See the docstring."""
-    return FIRST_MIN <= int(minute) <= LAST_MIN
+    13:52 is closer to 14:00's sun than to 13:30's, so nearest and not floor. 23:50 wraps
+    to 0 rather than running off the end of SLOTS -- which is the whole point of there
+    being no window: 23:50 is a real time to ask for a walk.
+    """
+    return int(round(float(minute) / step) * step) % (24 * 60)
 
 
 def nearest(slot, have):
@@ -90,8 +107,9 @@ def as_slot(t):
     """Accept a slot, an int hour, or 'HH:MM' and return a slot.
 
     An int below 24 is read as an HOUR, because every legacy caller and every bench
-    script passes one. 6 -> 360, 360 -> 360. The ambiguity is real but it is bounded:
-    minute-of-day 0..23 is 00:00-00:23, which is outside the window and never priced.
+    script passes one. 6 -> 360, 360 -> 360. The ambiguity is real and it is now a
+    genuine one -- minute-of-day 0..23 is 00:00-00:23, which IS priced now that the
+    window is gone -- so pass a slot, or 'HH:MM', from anything new.
     """
     if isinstance(t, str):
         if ":" in t:

@@ -1,7 +1,18 @@
 import { API_BASE } from './config';
 
-export type ConditionCode = 'sunny' | 'partly_cloudy' | 'cloudy' | 'drizzle' | 'rain';
-export type OptionLabel = 'Coolest' | 'Balanced' | 'Shortest' | 'Least UV';
+export type ConditionCode =
+  | 'sunny'
+  | 'partly_cloudy'
+  | 'cloudy'
+  | 'drizzle'
+  | 'rain'
+  /** The sun is below the horizon. Decided by the sun's POSITION, never by cloud. */
+  | 'night';
+/** `Coolest` and `Warmest` are the same badge -- least degC-minutes outside the UTCI
+ *  comfort band -- named for the direction the stress actually runs. On a cold night
+ *  the least-stressed walk is the WARM one, and calling it Coolest contradicts the
+ *  cold_stress figure printed beside it. */
+export type OptionLabel = 'Coolest' | 'Warmest' | 'Balanced' | 'Shortest' | 'Least UV';
 export type Objective = 'thermal' | 'uv';
 
 export interface Conditions {
@@ -12,11 +23,6 @@ export interface Conditions {
   time: string;
   /** Legacy whole-hour form of `slot`, kept so older clients keep parsing. */
   hour: number;
-  /** True when the wall clock fell outside 06:00-20:00 and was pulled into it. */
-  clamped: boolean;
-  /** False when the sun is below the horizon: the beam was ZEROED, not carried over
-   * from the nearest daylight slot, so there is no shade worth detouring for. */
-  beam: boolean;
   /** Where the radiation came from: the 15-minute series, or interpolated hourly. */
   rad_source: string;
   /** The day actually priced. Today unless SHADEME_DATE pins it. */
@@ -30,6 +36,13 @@ export interface Conditions {
   uv_source: string;
   uv_index_feed: number | null;
   condition: ConditionCode;
+  /** Which quantity drew the glyph and its value -- the sun's elevation, the beam as a
+   *  fraction of clear sky, or (last resort, and it says so) cloud cover. */
+  condition_source: string;
+  /** Degrees above the horizon at the hour being priced. Null without pvlib. */
+  solar_elevation: number | null;
+  /** Direct radiation over what a clear sky would deliver. Null when unreadable. */
+  beam_fraction: number | null;
   cloud_cover: number;
   precipitation: number;
   wind_speed: number;
@@ -127,8 +140,11 @@ export interface RoutesMeta {
   slot: number;
   time: string;
   hour: number;
-  clamped: boolean;
-  beam: boolean;
+  /** The sky at the slot priced. `night` is one of its states -- there is no window and
+   *  no clamp, so `clamped` and `beam` are gone with them. */
+  condition: ConditionCode;
+  condition_source: string;
+  solar_elevation: number | null;
   rad_source: string;
   /** Spacing of the shade/Ts grid this was priced on, in minutes. */
   step_min: number;

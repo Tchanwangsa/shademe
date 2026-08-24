@@ -24,9 +24,21 @@ Resources). You pay this once; the container itself starts in seconds.
 
 The finished `out/` is ~900 MB before the image prunes the benchmark sets and PNGs.
 
-**Give the container 2 GB.** Measured ~585 MB steady state once the graph and rasters are
-resident, plus the surface-energy march on top of that. Below ~1.5 GB it gets OOM-killed
-partway through a route, which looks like a random 502 rather than an obvious crash.
+**Give the container 2 GB.** Measured ~585 MB steady state once the graph and rasters
+are resident, plus the surface-energy march on top of that. Peak RSS through a cold
+march, on the real grid with the graph already loaded:
+
+| clock | slots marched | peak RSS |
+|---|---|---|
+| hourly, 06–20 window | 15 | 865 MB |
+| hourly, whole clock | 24 | 865 MB |
+| **half-hourly, whole clock** (shipping) | **48** | **1143 MB** |
+
+`engine.attach_tsurf` streams each slot onto the edges and drops the raster rather than
+accumulating — the same 24 h march measured 1153 MB when it accumulated, and at the
+half-hour step accumulating would want 48 × 24.2 MB = 1.16 GB of Ts on its own and would
+not fit this container at all. Below ~1.5 GB it gets OOM-killed partway through a route,
+which looks like a random 502 rather than an obvious crash.
 
 **Overpass rate-limits.** If the build dies in `fetch_osm` or `materials`, that is
 usually it. Re-run the build — finished stages are skipped, so it resumes rather than

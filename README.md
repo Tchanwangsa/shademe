@@ -123,7 +123,7 @@ shademe/
   provenance.py       the stamp that says which config produced a number
   physics/            shadow, svf, canopy_svf, surface_temp, mrt  -- pure, no I/O
   pipeline/           fetch -> dsm -> tree_heights -> shade -> materials -> graph
-  api/                main, engine, cost, routing, weather, uv, hours
+  api/                main, engine, cost, routing, weather, sky, uv, hours
 tests/                run directly; exit non-zero on failure
 tools/                benchmarks, source evaluations, sensor validation
 data/                 inputs (mostly fetched; three files are hand-authored)
@@ -178,21 +178,113 @@ keystroke. Anything past demo traffic should self-host.
 
 The background prewarm thread — not the first caller — pays for the surface
 energy-balance march (~40 s) and for generating the shade set when none matches today's
-sun (~27 s for 29 rasters). Calls are about 100 ms.
+sun (~27 s). Calls are about 100 ms.
 
 There is no `hour` parameter, by design: everything is priced at the wall clock in
-Australia/Melbourne, snapped to the **nearest half hour** and clamped to the 06:00–20:00
-window. That window is not a guess — over all 8760 hours of 2026 the sun's apparent
-elevation never exceeds −9.20° at 05:00 or −3.26° at 21:00 here, and `tests/test_timegrid.py`
-re-derives it from pvlib rather than trusting the constant. Outside it the response
-carries `meta.beam: false` and the beam is **zeroed**, not borrowed from 20:00 — pricing a
-21:30 walk on a sun that set at 20:44 made the router prefer shade in the dark.
+Australia/Melbourne, snapped to the **nearest half hour** — **all 24 hours of it**, with
+no clamp.
+
+Both halves of that sentence used to be smaller. The grid was hourly, and it was clamped
+to a 06:00–20:00 window.
+
+**The half hour.** At solar noon in January the solar azimuth swings 23.4° in half an
+hour, so an hourly raster is up to 30 minutes stale at its worst point. Against a rebuilt
+13:30 raster, nearest-hour sampling put 2.9 % (Jan) to 3.8 % (Aug) of cells on the wrong
+side of a shadow edge, and on a hot day two of three test pairs now pick a *distinct*
+15:30 path rather than one of the two bracketing hours — so this moves routes, not just
+reported numbers. 15 minutes was measured too and does not pay for itself. The march
+costs the same either way: `surface_temp.march()` derives `dt` from the spacing of the
+clock it is handed and picks `n_sub` to land on `SUB_DT`, so hourly/12 and half-hourly/6
+are both dt = 300 s. The clock got finer and the integration did not, which is what keeps
+the accumulation integral — the only part of the model with memory — comparable across
+the change (0.0175 K max on the same forcing, checked in the tests).
+
+**The window.** At 23:53 the app priced 20:00 and showed an 8 pm temperature, an 8 pm sky
+glyph and an arcade gate that thought Melbourne Central was open at midnight. Nothing had
+to be computed to remove it. Below `shadow.SUN_MIN_DEG` (5°) every mask in the shadow
+sweep already returns *fully shaded*, so a night raster is the constant 1.0 in all 6.1 M
+cells — `pipeline.shade` writes no file for those slots and `api.engine` reads a missing
+raster as full shade. The surface march has always run the whole 24 h clock internally;
+it was simply never asked to emit the dark slots.
+
+The two changes pay for each other. The sun gate is a **strict subset** of the window it
+replaces on every day of the year, so covering 24 h at half-hour resolution writes *fewer*
+rasters than the window did at the same step — measured at this latitude:
+
+| day | sunlit half-hour rasters | the old window |
+|---|---|---|
+| 2026-06-21 | 17 (08:30–16:30) | 29 |
+| 2026-08-24 | 20 (07:30–17:00) | 29 |
+| 2026-01-26 | 27 (07:00–20:00) | 29 |
+| 2026-12-21 | 28 (06:30–20:00) | 29 |
+
+And going the other way: a Ts raster is 24.2 MB on this grid and the march must produce
+one for *every* slot, dark ones included — the accumulation integral is the only part of
+the model with memory, so the night is what the morning is warm from. Holding all 48 is
+1.16 GB, which will not fit the 2 GB container. `engine.attach_tsurf` streams each slot
+onto the edges and drops the raster, which is what makes the half-hour grid fit at all.
+Measured peak RSS through a cold march on this grid: 865 MB streaming the hourly clock
+against 1153 MB accumulating it, and **1143 MB streaming all 48 half-hour slots** —
+accumulating those was never measured because the 1.16 GB of Ts alone does not fit the
+container. See DEPLOY.md.
+
+There is no `meta.beam` flag any more either. It zeroed the radiation outside the window,
+because serving a 21:30 walk off the 20:00 slot priced it on a beam that set at 20:44.
+With no clamp, 21:30 reads 21:30's own row, whose direct radiation is zero because the
+sun is down — `meta.condition` says `night`, from the same `SUN_MIN_DEG` the router gates
+on.
 
 Radiation comes from Open-Meteo's 15-minute series where it reaches (`meta.rad_source`),
 because that is the one variable whose sub-hourly structure is real: a cloud crossing
 reads 267 → 208 → 503 W/m² inside two hours the hourly series flattens to 280 and 210.
 Temperature is not taken from it — at 15 minutes Open-Meteo simply interpolates its own
 hourly endpoints, so there is nothing there to take.
+
+### The sky glyph
+
+The chip over the map used to pick its icon with a rule that fell through to cloud cover
+whenever there was no beam to read:
+
+```python
+if direct + diffuse < 20:                    # dusk: no beam to read
+    return "cloudy" if cloud_cover >= 60 else "sunny"
+```
+
+Cloud cover carries no information about whether the sun exists, so that rule cannot tell
+a clear night from a clear dawn — and at 23:53 with 2 % cloud it drew a **sun over
+Melbourne at midnight**. `api/sky.py` replaces it with two questions answered from two
+different things:
+
+* **Is the sun up?** From the sun's position, and from nothing else. Below
+  `shadow.SUN_MIN_DEG` the glyph is `night` — the *same* constant the shadow sweep uses
+  to decide every cell is shaded, so the icon and the router cannot disagree about
+  whether there is sun to walk out of.
+* **Is the beam landing?** From beam *transmission* — `direct_radiation` over what a
+  clear sky would deliver at that solar elevation (Haurwitz 1946 for the global,
+  Meinel & Meinel 1976 over a Kasten–Young air mass for the beam). A ratio, not a
+  threshold in W/m², because 100 W/m² of beam is a heavily clouded noon and a perfectly
+  clear 8 am — and the old absolute cut-offs called the second one "partly cloudy".
+
+Checked against Open-Meteo's own clear hours (cloud ≤ 5 %, sun above 20°) over two
+seasons of Melbourne archive: mean clear-sky index 1.010 sd 0.055 in summer (n=229) and
+0.946 sd 0.063 in winter (n=42) — a few percent, far tighter than the 0.15 / 0.50 bands
+care about. Every response carries `condition_source` naming the quantity that decided
+and its value, the way `uv_source` does. Cloud cover survives in one clearly-labelled
+branch: the slot in which the sun is up by the wall clock but the radiation row it came
+with covers a window the sun was too low to deliver a readable beam through.
+
+**A caveat found while calibrating this, and it is bigger than the glyph.** Open-Meteo
+returns `utc_offset_seconds: 36000` for a January range as well as an August one — its
+Melbourne timestamps are in a **fixed +10:00 and do not carry AEDT** — and each hourly
+row is the mean over the *preceding* hour. Sweeping the offset against clear hours shows
+it: the two seasons want offsets exactly one hour apart in a DST-aware frame, and the
+same −30 min in the fixed frame. Everything else in this project reads a slot's row as
+"local time = that slot", which is right to within half an hour in winter and **an hour
+out in summer**. `weather.row_elevation` divides the glyph's beam by the right clear-sky
+number — generalising the measured −30 min to the interpolated grid, and stating that the
+same convention is only *assumed* for the 15-minute series — but it does not repair the
+alignment underneath it, because doing so moves every temperature, radiation and UTCI
+figure here and wants its own validation.
 
 Bind to `0.0.0.0` for a physical phone — `localhost` resolves to the phone itself.
 

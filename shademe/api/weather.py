@@ -22,6 +22,7 @@ radiation quoted in a response is always the radiation that was priced.
 """
 import os, json, time, requests
 
+from . import sky as SKY
 from . import uv as UV
 from ..paths import DATA
 from .. import timegrid as TG
@@ -482,22 +483,80 @@ def _slot_offset(p, slot):
     return a + (b - a) * ((int(slot) % 60) / 60.0)
 
 
-def solar_elevation(day, when):
-    """Solar elevation in degrees, or None if the astronomy helper is not importable.
+def solar_elevation(day, when, minutes=0, tz=TZ):
+    """Solar elevation in degrees at `day when`, offset by `minutes`, or None.
 
-    Only the archive path needs it (uv.clear_sky), so an ImportError must degrade to "no
-    UV" rather than take the weather block down with it.
+
+    An ImportError must degrade to "no UV" and "no sky state" rather than take the
+    weather block down with it, so every caller has to handle None.
     """
     try:
         import pandas as pd
         from ..physics.shadow import sun_position
         slot = TG.as_slot(when)
-        return float(sun_position(pd.Timestamp(f"{day} {TG.label(slot)}", tz=TZ))[1])
+        t = pd.Timestamp(f"{day} {TG.label(slot)}", tz=tz) + pd.Timedelta(minutes=minutes)
+        return float(sun_position(t)[1])
     except Exception:
         return None
 
 
-def block(when, day=None, now_min=None, wet=False, beam=True):
+# WHICH INSTANT A RADIATION NUMBER STANDS FOR. Open-Meteo labels its hourly rows in a
+# FIXED +10:00 for Melbourne -- it returns `utc_offset_seconds: 36000` for a January range
+# as well as an August one, so its summer timestamps do not carry AEDT -- and each row is
+# the MEAN OVER THE PRECEDING HOUR. So the radiation in row `hh` was collected over
+# [hh-1, hh] in +10:00, and the instant that represents it is half an hour before the
+# label, in that fixed frame.
+#
+# Measured rather than assumed. Sweeping the offset and scoring the spread of the
+# clear-sky index over clear hours (cloud <= 5%, sun above 20 deg) of Melbourne archive:
+#
+#     offset      summer (AEDT)        winter (AEST)
+#     -60 min     mean 0.95 sd 0.38    mean 0.92 sd 0.12
+#     -30 min     mean 0.95 sd 0.30    mean 0.95 sd 0.06   <- winner, AEST frame
+#       0 min     mean 1.00 sd 0.14    mean 0.96 sd 0.13
+#     +30 min     mean 1.01 sd 0.06    mean 0.94 sd 0.22   <- winner, AEDT frame
+#
+# The two seasons want offsets exactly one hour apart in a DST-aware frame, and the SAME
+# -30 min in the fixed +10:00 frame (sd 0.055 summer, 0.063 winter). That is the DST gap,
+# and it is the proof of the fixed frame.
+#
+# CAVEAT, AND IT IS BIGGER THAN THIS FUNCTION. Everything else in this project reads a
+# slot's row as "local time = that slot" -- the shade raster for a slot is cast at that
+# local time, and the surface march forces the slot with its own row. Under the frame
+# above that is right to within half an hour in winter and an hour out in summer. Fixing
+# it moves every temperature, radiation and UTCI figure the project reports and wants its
+# own validation, so it has NOT been done here. These two functions exist so the sky glyph
+# at least divides by the right clear-sky number; they do not repair the alignment
+# underneath it.
+FEED_TZ = "Etc/GMT-10"          # fixed +10:00 -- Open-Meteo's frame, DST or not
+FEED_ROW_MINUTES = -30          # hourly rows are the mean over the preceding hour
+
+
+def row_elevation(day, slot, source="hourly", step=None):
+    """Solar elevation over the window the radiation on row `slot` was averaged over.
+
+    Two cases, because slot_rows joins two series and they do not cover the same window:
+
+      HOURLY (INTERPOLATED). Each hourly row is centred half an hour before its label in
+      FEED_TZ (measured, above); a linear interpolation between two such rows is centred
+      half an hour before the interpolation point. So `slot` - 30 min, in FEED_TZ. This is
+      the generalisation of the measurement, not a new assumption.
+
+      MINUTELY_15. _rad_over averages the 15-minute rows labelled `slot` and `slot`+15,
+      which under the same preceding-window convention together cover [slot-15, slot+15).
+      The centre is `slot` itself, and the FEED_ROW_MINUTES shift cancels. Stated as what
+      it is: the row-labelling convention was MEASURED for the hourly series and is only
+      ASSUMED to carry over to minutely_15, so this branch is good to +/-15 min. It is
+      tolerable here because elev_row is only ever a DENOMINATOR for the sky glyph -- it
+      does not enter the routing, the march, or any reported figure.
+    """
+    step = TG.STEP_MIN if step is None else int(step)
+    if str(source).startswith("minutely_15"):
+        return solar_elevation(day, slot, 0, FEED_TZ)
+    return solar_elevation(day, slot, FEED_ROW_MINUTES, FEED_TZ)
+
+
+def block(when, day=None, now_min=None, wet=False):
     """The weather block for one SLOT of one day. `when` is a slot, an hour, or 'HH:MM'.
 
     Read off slot_rows(), not off the hourly rows, so the radiation reported here is the
@@ -507,10 +566,12 @@ def block(when, day=None, now_min=None, wet=False, beam=True):
     MEASUREMENT rather than a model: the live ARPANSA reading can only answer for right
     now. None means "do not claim anything is live" and gives the modelled branch.
 
-    `beam=False` zeroes direct and diffuse radiation and the UV index. That is for times
-    OUTSIDE the daylight window, where the sun is below the horizon at this latitude on
-    every day of the year (timegrid explains the window) and the alternative -- serving
-    the last daylight slot's numbers -- prices a 21:30 walk on a beam that set at 20:44.
+    There is no `beam` flag any more. It zeroed the radiation outside a 06:00-20:00
+    window, because the clamp served a 21:30 walk off the 20:00 slot and priced it on a
+    beam that had set at 20:44. With the clamp gone the row for 21:30 is 21:30's own, and
+    its direct radiation is zero because the sun is down -- the feed says so and does not
+    have to be corrected into saying it. What the sun's POSITION still asserts here is the
+    UV floor below the horizon; see the `elev` gate below.
 
     `wet` restores the legacy precipitation/wind weight, which only the old `edge_cost`
     path reads. The physical engine uses neither w_heat nor w_wet.
@@ -521,8 +582,6 @@ def block(when, day=None, now_min=None, wet=False, beam=True):
     h = slot if slot in rows else TG.nearest(slot, rows)
     r = rows[h]
     direct, diffuse = _f(r["direct_radiation"]), _f(r["diffuse_radiation"])
-    if not beam:
-        direct = diffuse = 0.0                 # sun is down -- see the docstring
     tot = direct + diffuse
     direct_fraction = (direct / tot) if tot > 0 else 0.0
     app = _f(r["apparent_temperature"])
@@ -551,11 +610,24 @@ def block(when, day=None, now_min=None, wet=False, beam=True):
     if uv_feed is None:
         uv_feed = r.get("uv_index_clear_sky")
     cloud = _f(r.get("cloud_cover"))
+    # Two solar elevations, because two different questions are asked of the sun.
+    # `elev` is the instant this slot is priced at -- the same instant the shade raster
+    # for it was cast at -- and answers "is the sun up". `elev_row` is the window the
+    # radiation above was averaged over, and is the only elevation the beam may be
+    # divided by. See row_elevation for why they differ. Both are None without pvlib.
+    elev = solar_elevation(p.get("date"), h)
+    elev_row = row_elevation(p.get("date"), h, r.get("rad_source", "hourly"))
     uv, uv_source = UV.index_for(h, now_min if now_min is not None else -1,
                                  None if uv_feed is None else float(uv_feed), cloud,
-                                 elev_deg=solar_elevation(p.get("date"), h))
-    if not beam:
-        uv, uv_source = 0.0, "sun below the horizon"
+                                 elev_deg=elev)
+    # THE SUN SETS THE UV TO ZERO, and it says so. The feed reports 0 UV at night and the
+    # ARPANSA reading is ~0, so this is belt-and-braces -- but it used to be asserted by
+    # the 06:00-20:00 window, and with the window gone it has to be asserted by the sun or
+    # not at all. The HORIZON, not SUN_MIN_DEG: there is real erythemal UV at 3 deg of
+    # elevation, which is above the horizon and below the shadow sweep's give-up angle.
+    if elev is not None and elev <= 0.0:
+        uv, uv_source = 0.0, f"sun {elev:.1f} deg -- below the horizon"
+    cond, cond_why = SKY.condition(direct, diffuse, cloud, precip, elev, elev_row)
     if not wet:
         w_wet = 0.0                              # legacy weight; off unless asked for
     return {
@@ -564,6 +636,15 @@ def block(when, day=None, now_min=None, wet=False, beam=True):
         "time": TG.label(h),
         "hour": TG.hour_of(h),                           # legacy field, whole hours only
         "rad_source": r.get("rad_source", "hourly"),
+        # The sky glyph and the number that chose it. NOT derived from cloud cover except
+        # in the branch `condition_source` names as such -- see api/sky.py.
+        "condition": cond,
+        "condition_source": cond_why,
+        "solar_elevation": None if elev is None else round(elev, 1),
+        "solar_elevation_row": None if elev_row is None else round(elev_row, 1),
+        "beam_fraction": (lambda k: None if k is None else round(k, 3))(
+            SKY.beam_fraction(direct, elev_row)),
+        "beam_clear": round(SKY.beam_clear(elev_row), 1),
         "temperature": round(temp, 1),
         "apparent_temperature": round(app, 1),
         "direct_radiation": round(direct, 1),
