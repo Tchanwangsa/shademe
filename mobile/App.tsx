@@ -17,6 +17,8 @@ import { OptionDetail } from './src/components/OptionDetail';
 import { PlacePicker } from './src/components/PlacePicker';
 import { addRecent } from './src/lib/recents';
 import { RouteMap } from './src/components/RouteMap';
+import { HeatSensitivity } from './src/components/HeatSensitivity';
+import { isDefault, loadWalker, NO_WALKER, saveWalker, type Walker } from './src/lib/walker';
 
 /** Conditions are re-read on this cadence. The engine prices the wall clock, so the
  * chips have to keep up with it without the user doing anything. */
@@ -82,6 +84,10 @@ function ShadeMe() {
   // The last GPS fix we are allowed to have. Only ever the fallback for "how far is
   // that?" in the picker -- routing still uses whatever the user actually picked.
   const [here, setHere] = useState<{ lat: number; lon: number } | null>(null);
+  // The two heat-sensitivity answers. Read from the device once and then owned here;
+  // `/routes` is re-asked whenever they change, because they change which walks the
+  // engine searches for, not merely which one is highlighted.
+  const [walker, setWalker] = useState<Walker>(NO_WALKER);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [detent, setDetent] = useState(1);
@@ -114,6 +120,16 @@ function ShadeMe() {
 
   useEffect(() => {
     let alive = true;
+    loadWalker()
+      .then((w) => alive && setWalker(w))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
     const tick = () => {
       api
         .conditions()
@@ -134,11 +150,15 @@ function ShadeMe() {
     setLoading(true);
     setError(null);
     api
-      .routes(from, to, ac.signal)
+      .routes(from, to, walker, ac.signal)
       .then((r) => {
         setRoutes(r);
         setConditions(r.conditions);
-        setSelectedId(r.options[0]?.id ?? null);
+        // The recommended option, not the first one. The list is sorted coolest-first,
+        // and selecting its head was an unstated preference for shade at any cost --
+        // see main.recommend. `recommended` is absent from a list of one, so the head
+        // is still the fallback.
+        setSelectedId(r.options.find((o) => o.recommended)?.id ?? r.options[0]?.id ?? null);
         sheet.current?.snapToIndex(1);
       })
       .catch((e) => {
@@ -148,7 +168,7 @@ function ShadeMe() {
       })
       .finally(() => setLoading(false));
     return () => ac.abort();
-  }, [from, to]);
+  }, [from, to, walker]);
 
   const useMyLocation = useCallback(async () => {
     setPicking(null);
@@ -180,6 +200,15 @@ function ShadeMe() {
 
   const options = routes?.options ?? [];
   const selected = options.find((o) => o.id === selectedId) ?? null;
+  const personalised = !isDefault(walker);
+
+  // Applied optimistically and written behind the render: the re-route fires off the
+  // state change either way, and a switch that waits on a file write to move feels
+  // broken. A failed write costs the setting next launch, nothing this session.
+  const changeWalker = (w: Walker) => {
+    setWalker(w);
+    void saveWalker(w);
+  };
 
   return (
     <View className="flex-1 bg-paper dark:bg-night">
@@ -232,6 +261,12 @@ function ShadeMe() {
             />
           </View>
 
+          <HeatSensitivity
+            walker={walker}
+            onChange={changeWalker}
+            detourCap={routes?.meta.detour_cap ?? null}
+          />
+
           {loading ? (
             <View className="items-center py-8">
               <ActivityIndicator color={theme.shade} />
@@ -257,6 +292,7 @@ function ShadeMe() {
                 <OptionCard
                   option={o}
                   selected={o.id === selectedId}
+                  personalised={personalised}
                   onPress={() => {
                     setSelectedId(o.id);
                     sheet.current?.snapToIndex(2);

@@ -140,7 +140,7 @@ Assuming [Quickstart](#quickstart) has been done once — `uv sync` **and**
 uv run uvicorn shademe.api.main:app --host 0.0.0.0 --port 8011
 ```
 
-`GET /health` `/conditions` `/routes?from_lat=&from_lon=&to_lat=&to_lon=`
+`GET /health` `/conditions` `/routes?from_lat=&from_lon=&to_lat=&to_lon=&unacclimatised=&vulnerable=`
 `/search?q=` `/reverse?lat=&lon=`, plus OpenAPI at `/docs`.
 
 ### Place search
@@ -173,6 +173,68 @@ Both providers are rate-limited free services. `geocode.py` throttles per host (
 Nominatim, per its usage policy), caches for 15 minutes, and sends an identifying
 User-Agent; the client debounces 300 ms so a search fires per word typed rather than per
 keystroke. Anything past demo traffic should self-host.
+
+### Who is walking
+
+`K` is the model's one free parameter — how much further a walk is worth to avoid one
+degree of heat stress — and until now it was the same number for everybody. It is a
+*preference*, and a preference belongs to a person. Two optional flags on `/routes` scale
+it, and they are separate because the two reasons are **independent**:
+
+| | acclimatised? | reduced capacity? | K multiplier |
+|---|---|---|---|
+| healthy Melbourne regular | yes | no | ×1.0 |
+| visitor, week 1 of a heatwave | **no** | no | ×1.8 |
+| elderly long-time resident | yes | **yes** | ×1.8 |
+| elderly visitor, week 1 | **no** | **yes** | ×3.24 |
+
+**Acclimatisation** is recent history: 1–2 weeks of repeated exposure earns a lower heart
+rate, earlier and more dilute sweating, and steadier blood pressure in heat. A visitor, a
+recent arrival and a lifelong local in the season's first hot spell are all equally
+unadapted — the first hot week catches a whole city at once. **Vulnerability** is capacity:
+65+, pregnancy, and cardiac or renal conditions reduce the ability to shed heat at all.
+Acclimatising raises that person's own baseline; it does not lift the ceiling. So they
+compose multiplicatively rather than overriding each other.
+
+The multiplier does two things. It **scales the thermal ladder**, so the searches explore
+the preferences that walker actually holds instead of offering them the nearest rung of
+someone else's — `meta.k_ladder` is what was walked, `meta.k_ladder_base` what an
+undeclared walker gets. And it **picks one option as `recommended`**, by scoring every
+returned walk in the router's own currency, restated per route:
+
+```
+weighted minutes = minutes + K * stress_load + doors * DOOR_PENALTY_M / (1.35 * 60)
+```
+
+That is not a second objective. It is the same sum the A\* minimised over edges, divided
+through by walking speed, so that walks found by different searches are comparable on one
+scale — checked against the real cost function in `tests/test_walker.py`. It is thermal
+only: UV is a *second* preference, not a term in this one, and combining them needs an
+exchange rate between a °C-minute and a UV index-minute that nothing here measures.
+
+**This replaces a hidden preference with a declared one.** The list was already choosing:
+sorted coolest-first, with the client selecting the top card — the behaviour of someone
+who would walk any distance to shed one degree, i.e. `K = ∞`, asserted nowhere and
+adjustable by nobody. Every option still ships in the same order; one now carries a badge,
+and `meta.walker` says which K put it there.
+
+**Said plainly: the direction is evidenced, the magnitude is not.** ×1.8 per flag comes
+from "a walk worth 6% further per degree to an adapted adult is worth about 11% to someone
+who is not" — a stated preference with no more behind it than `K_DEFAULT` itself has. One
+flag stands in for three quite different physiologies, and there is deliberately no
+per-condition scoring: that would be a clinical risk calculator with nothing validating it.
+What makes an uncalibrated number safe to ship is that **it cannot run away** — K buys only
+detour, `DETOUR_CAP` bounds detour at 1.4× the direct walk, and `_route_pref` halves K
+until it fits. There is no setting of these two switches that sends anyone somewhere the
+unpersonalised app would refuse to send them, and the app quotes that ceiling back from
+`meta.detour_cap` rather than hardcoding it in the copy.
+
+The answers live on the device (`shademe-walker.json`, next to recents) and ride on the
+query string. The server stores nothing, and an untouched dial sends no parameters at all,
+so `meta.walker.k_multiplier == 1` is provably unpersonalised rather than personalised back
+to the default. `K_uv` is **not** scaled: neither question asks anything bearing on how
+much erythemal UV a person should collect, and borrowing a heat answer to move a UV route
+would be claiming an authority it does not have.
 
 The first `/routes` call of the day pays for the surface energy-balance march (~45 s) and
 regenerates the shade set if none matches today's sun (~35 s). Every call after that is

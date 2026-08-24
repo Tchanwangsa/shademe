@@ -65,6 +65,15 @@ export function OptionDetail({ option, meta }: { option: RouteOption; meta: Rout
       </View>
 
       <View className="mt-3 border-t border-line pt-2.5 dark:border-line-dark">
+        {/* Says WHY this one, and in the units the dial is in. The multiplier is the
+            whole mechanism -- there is no second model behind the badge -- so quoting it
+            is both the explanation and the disclosure. */}
+        {option.recommended && (meta.walker?.k_multiplier ?? 1) > 1 ? (
+          <Note icon="body-outline">
+            {`Recommended for the heat sensitivity you set: shade is worth ${meta.walker!.k_multiplier.toFixed(1)}× the extra walking here that it would be by default`}
+          </Note>
+        ) : null}
+
         {!option.is_shortest && heatSaved > 0.5 ? (
           <Note icon="thermometer-outline">
             {`${dose(heatSaved)} less heat than walking direct, for ${Math.round(option.avoided.extra_m)} m further`}
