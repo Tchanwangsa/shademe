@@ -3,9 +3,9 @@
 The physics lives in engine/cost/routing/weather/hours; this module is only the surface
 the mobile client talks to. It makes three commitments:
 
-  * REAL TIME, NOT A SCRUBBER. There is no `hour` parameter. Every request is priced at
-    the wall clock in Australia/Melbourne, clamped to the 06..20 window the shade rasters
-    cover. A demo that can be dialled to its best hour is not evidence.
+  * REAL TIME, NOT A SCRUBBER. There is no `hour` parameter and no clamp. Every request
+    is priced at the wall clock in Australia/Melbourne, all 24 hours of it. A demo that
+    can be dialled to its best hour is not evidence.
   * OPTIONS, NOT A PAIR. `/routes` walks a ladder of K -- the thermal knob -- and a
     second ladder under the UV objective, and returns the distinct paths that fall out of
     both. Two searches producing the same walk collapse to one option, which is the
@@ -35,11 +35,21 @@ from .cost import (summarise, segments, thermal_summary, compare_thermal,
                    uv_summary, compare_uv)
 from ..paths import OUT
 
-# The shade rasters cover 06:00-20:00. Outside it we clamp and say so in `meta.clamped`
-# rather than quietly pricing 23:00 on the 20:00 sun. The day priced is today unless
-# SHADEME_DATE pins it; the shade set follows that date, so the first request on a new
-# day regenerates it (~13 s) rather than costing today's walk on yesterday's shadows.
-FIRST_HOUR, LAST_HOUR = 6, 20
+# THE WHOLE CLOCK. The hourly window used to be 06..20 -- the hours the shade rasters
+# were generated for -- and the wall clock was clamped into it, so 23:53 was priced on
+# the 20:00 sun and shown as if it were now: an 8pm temperature, an 8pm sky glyph, and
+# an arcade gate that thought Melbourne Central was open at midnight.
+#
+# Nothing needed to be computed to remove it. Below shadow.SUN_MIN_DEG every mask in the
+# shadow sweep already returns "fully shaded", so a night raster is the constant 1.0 --
+# pipeline.shade does not write one and api.engine reads a missing raster as full shade.
+# The surface march has always run the full 24 h clock; it just was not asked to emit the
+# dark hours. So the night is priced, not clamped away, and it costs no disk and no march.
+#
+# The day priced is today unless SHADEME_DATE pins it; the shade set follows that date,
+# so the first request on a new day regenerates it (~9 s) rather than costing today's
+# walk on yesterday's shadows.
+ALL_HOURS = range(24)
 FALLBACK_HOUR = 16          # only for the graph-rebuild path, never for pricing
 
 # The thermal ladder. 0 is "shortest, no preference" (routing.route_utci short-circuits
@@ -127,8 +137,7 @@ def load_graph():
         stamp = time.strftime("%H:%M", time.localtime(os.path.getmtime(p)))
         return pickle.load(open(p, "rb")), f"out/graph.pkl ({stamp})"
     from ..pipeline import graph as build_graph
-    have = [h for h in range(FIRST_HOUR, LAST_HOUR + 1)
-            if os.path.exists(f"{OUT}/shade_{h:02d}.npy")]
+    have = [h for h in ALL_HOURS if os.path.exists(f"{OUT}/shade_{h:02d}.npy")]
     if not have:
         raise RuntimeError(
             "no graph.pkl and no hourly shade rasters -- run "
@@ -309,43 +318,26 @@ def now_local():
 
 
 def now_hour():
-    return max(FIRST_HOUR, min(LAST_HOUR, now_local().hour))
+    """The hour being priced. THE WALL CLOCK, unmodified -- see ALL_HOURS."""
+    return now_local().hour
 
 
-def condition_code(w):
-    """A coarse sky state for the client's glyph.
-
-    LED BY THE BEAM, not by cloud cover. Melbourne reported 78% cloud with 438 W/m2 of
-    direct radiation on one test day -- thin high cloud the sun comes straight through --
-    and going by cloud alone drew a "partly cloudy" glyph over a city that was sunny.
-    The beam is also the quantity this product is about: if it is landing, shade is worth
-    walking for, and the icon should agree with the routing.
-    """
-    if w["precipitation"] >= 0.5:
-        return "rain"
-    if w["precipitation"] > 0.0:
-        return "drizzle"
-    direct, diffuse = w["direct_radiation"], w["diffuse_radiation"]
-    if direct + diffuse < 20:                  # dusk: no beam to read, fall back to cloud
-        return "cloudy" if w["cloud_cover"] >= 60 else "sunny"
-    if w["direct_fraction"] >= 0.5 and direct >= 100:
-        return "sunny"
-    if direct >= 40:
-        return "partly_cloudy"
-    return "cloudy"
+# The sky state moved to api/sky.py, where it is derived from the beam and the sun's
+# position instead of from cloud cover. weather.block() carries it already priced.
 
 
 def conditions_block():
     t = now_local()
     h = now_hour()
-    # now_hour() is passed separately from the hour being priced: they differ only when
-    # the wall clock falls outside 06-20, and the live UV measurement is only allowed to
-    # answer for the real current hour. See uv.py.
+    # `now_hour` is what lets the UV index be the live ARPANSA MEASUREMENT rather than a
+    # model -- the network publishes the current value only, so it can answer for this
+    # hour and no other (see uv.index_for). It is the same number as `h` now that the
+    # clamp is gone, and passing it anyway keeps that a property of this call site rather
+    # than an assumption baked into weather.block, which tools/ calls for other hours.
     w = weather.block(h, now_hour=t.hour)
     return {
         "as_of": t.isoformat(),
         "hour": h,
-        "clamped": h != t.hour,
         "date": w["date"],
         "is_today": w["date"] == str(t.date()),
         "temperature": w["temperature"],
@@ -355,7 +347,13 @@ def conditions_block():
         # number without this is not checkable against the reading on someone's phone.
         "uv_source": w["uv_source"],
         "uv_index_feed": w["uv_index_feed"],
-        "condition": condition_code(w),
+        "condition": w["condition"],
+        # WHICH QUANTITY DREW THE GLYPH, and its value. The sun-position and beam
+        # branches are checkable against the sky; the cloud-cover branch is the last
+        # resort and says so. Same contract as uv_source above.
+        "condition_source": w["condition_source"],
+        "solar_elevation": w["solar_elevation"],
+        "beam_fraction": w["beam_fraction"],
         "cloud_cover": w["cloud_cover"],
         "precipitation": w["precipitation"],
         "wind_speed": w["wind_speed"],
@@ -534,6 +532,14 @@ def label_options(opts, uv_index):
     walk, and saying so is more informative than picking a winner; when they are not, the
     two badges are exactly the choice being offered. "Least UV" is withheld when there is
     no UV to avoid rather than pinned on an arbitrary card.
+
+    THE LEAST-STRESS BADGE IS NAMED AFTER THE STRESS IT ACTUALLY AVOIDS. `stress_load` is
+    degC-minutes outside the 9..26 UTCI band in EITHER direction, and the winner used to
+    be called "Coolest" whichever direction that was. Priced across the whole clock that
+    is wrong most nights: at 00:13 on 24 August the two options here carried 16.1 and
+    28.3 degC-min of pure COLD stress and zero heat, so the badge sat on the WARMEST walk
+    and called it the coolest one. Same class of error as a sun at midnight -- a word the
+    physics on the same card contradicts.
     """
     if not opts:
         return
@@ -544,12 +550,17 @@ def label_options(opts, uv_index):
     spread = max(o["summary"].get("uv_dose", 0.0) for o in opts) - \
         min(o["summary"].get("uv_dose", 0.0) for o in opts)
     uv_worth_naming = bool(uv_index) and uv_index > 0 and spread > SAME_WALK_UV
+    # Which way the stress runs, over the whole option set rather than per card, so two
+    # cards in one list can never carry opposite badges for the same weather.
+    heat = sum(o["summary"].get("heat_stress", 0.0) for o in opts)
+    cold = sum(o["summary"].get("cold_stress", 0.0) for o in opts)
+    least_stress = "Warmest" if cold > heat else "Coolest"
     for o in opts:
         labels = []
         if o["is_shortest"]:
             labels.append("Shortest")
         if o["id"] == coolest and o["summary"].get("stress_load", 0.0) > 0:
-            labels.append("Coolest")
+            labels.append(least_stress)
         if uv_worth_naming and o["id"] == least_uv:
             labels.append("Least UV")
         o["labels"] = labels
@@ -630,8 +641,8 @@ def search(q: str = Query("", max_length=120), limit: int = Query(8, ge=1, le=20
     """
     q = " ".join(q.split())
     # One clock for every row in this response, so two places cannot be judged against
-    # times a second apart. Real wall clock, NOT the clamped routing hour -- a place is
-    # shut at 23:00 even though routing prices that walk at 20:00.
+    # times a second apart. It is now the same clock the router prices at -- the hourly
+    # window used to be clamped to 06..20 and this had to say so; see ALL_HOURS.
     when = now_local()
     near = None if near_lat is None or near_lon is None else (near_lat, near_lon)
     shut = closed_now()

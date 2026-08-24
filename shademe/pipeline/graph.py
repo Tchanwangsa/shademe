@@ -14,7 +14,11 @@ from ..paths import DATA, OUT
 
 _tf = Transformer.from_crs(WGS84, MGA55, always_xy=True)
 
-HOURS = list(range(6, 21))
+# The whole clock. Only the LEGACY `shade` dict pickled into out/graph.pkl is built
+# here -- api.engine re-samples the shipped set per request -- but it has to cover the
+# same hours, or a fallback read of the pickle at 03:00 finds no entry. Dark hours have
+# no raster and are 1.0; see api.engine._shade_path.
+HOURS = list(range(24))
 SNAP_M = 15.0       # auto-snap radius for indoor component endpoints
 # The day the pickled shade dict is baked for. The API re-samples per request
 # date, so this only fixes what a fresh `graph.pkl` carries as its baseline.
@@ -340,7 +344,9 @@ def sample_hourly(G, grid, hours=HOURS, n=N_SAMPLE, out=OUT):
     for h in hours:
         p = f"{out}/shade_{h:02d}.npy"
         if not os.path.exists(p):
-            print(f"  ! missing {p}; shade[{h}] = 0"); vals = np.zeros(len(sun), dtype=np.float32)
+            # FULL SHADE, not zero. No raster means the sun is below SUN_MIN_DEG, and
+            # 0 said the opposite -- every edge in open sun, at night.
+            vals = np.ones(len(sun), dtype=np.float32)
         else:
             g = np.load(p, mmap_mode="r").ravel()
             vals = (np.asarray(g[flat]) * inside).sum(1) / cnt

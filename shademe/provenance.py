@@ -74,7 +74,7 @@ def _git():
     return {"commit": commit, "dirty": dirty}
 
 
-def stamp(mode="summer", hours=range(6, 21)):
+def stamp(mode="summer", hours=range(24)):
     """Everything a reported figure depends on. Safe to call from anywhere."""
     cache = _cache_load()
     hours = list(hours)
@@ -114,15 +114,24 @@ def stamp(mode="summer", hours=range(6, 21)):
         paths = [f"{OUT}/shade_{h:02d}.npy" for h in hours]
         _svf_path = lambda: (f"{OUT}/svf_veg.npy" if os.path.exists(f"{OUT}/svf_veg.npy")
                              else f"{OUT}/svf_all.npy")
-    digs = [sha(p, cache) for p in paths]
-    dirs = sorted({os.path.relpath(os.path.dirname(p), OUT) for p in paths})
-    # The DAY the shadows were cast for, distinct from demo_day below: the set is chosen
-    # from the date being priced, so a stamp naming only the demo day would read
-    # "shade v2_winter ... day 2026-01-26" and invite the wrong conclusion.
+    # A None path is an hour with the sun below SUN_MIN_DEG: no raster is written for it
+    # and the engine prices it as full shade. Stamped as "night" rather than skipped --
+    # a set that stops at 20:00 and one that stops at 17:00 are different sets, and the
+    # stamp has to be able to say which was read.
+    digs = [None if p is None else sha(p, cache) for p in paths]
+    dirs = sorted({os.path.relpath(os.path.dirname(p), OUT) for p in paths if p})
+    lit = [h for h, p in zip(hours, paths) if p]
     s["shade"] = {"dir": "/".join(d if d != "." else "out" for d in dirs),
+                  # The DAY the shadows were cast for, distinct from demo_day below: the
+                  # set is chosen from the date being priced, so a stamp naming only the
+                  # demo day would read "shade v2_winter ... day 2026-01-26" and invite
+                  # the wrong conclusion.
                   "day": shade_day,
-                  "hours": [hours[0], hours[-1]], "set_sha": _rollup(digs),
-                  "files": {f"{h:02d}": d for h, d in zip(hours, digs)}}
+                  "hours": [lit[0], lit[-1]] if lit else [],
+                  "night_hours": [h for h, p in zip(hours, paths) if p is None],
+                  "set_sha": _rollup([d for d in digs if d]),
+                  "files": {f"{h:02d}": (d or "night")
+                            for h, d in zip(hours, digs)}}
     svf = _svf_path()
     s["svf"] = {"path": os.path.relpath(svf, ROOT) if svf else None,
                 "sha": sha(svf, cache) if svf else None}

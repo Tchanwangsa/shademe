@@ -21,7 +21,22 @@ from . import uv as UV
 
 PHYSICS_SRC = ("surface_temp.py", "mrt.py", "shadow.py")
 PHYSICS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "physics"))
-HOURS = list(range(6, 21))
+
+# THE WHOLE CLOCK. This was 06..20 -- the hours a shade set has files for -- and the API
+# clamped the wall clock into it. The rasters were never the reason: below
+# shadow.SUN_MIN_DEG every mask in the sweep returns "fully shaded", so a night raster is
+# the constant 1.0 and pipeline.shade does not write one. _shade_path() returns None for
+# those hours and every reader below treats that as FULL SHADE, which is what it is.
+#
+# So an old set built only for 06..20 keeps working unchanged: hours 21..05 simply have
+# no file, which is the same statement as "the sun is down". Nothing has to be
+# regenerated to route at 3am.
+HOURS = list(range(24))
+
+# Probe hour for "does this directory hold a shade set". Must be an hour the sun is up
+# for on every day of the year, since the dark hours legitimately have no file: 13:00
+# local is above 27 deg in Melbourne even at the winter solstice.
+PROBE_HOUR = 13
 TZ = "Australia/Melbourne"
 N_SAMPLE = 8
 
@@ -77,7 +92,7 @@ def _sets_on_disk():
             day = json.load(open(p)).get("day")
         except (ValueError, OSError):
             continue
-        if day and os.path.exists(os.path.join(OUT, d, f"shade_{HOURS[0]:02d}.npy")):
+        if day and os.path.exists(os.path.join(OUT, d, f"shade_{PROBE_HOUR:02d}.npy")):
             out[d] = day
     return out
 
@@ -118,7 +133,7 @@ def ensure_shade_set(day):
               f"generation disabled -- using it anyway")
         return d
     name = f"{GEN_PREFIX}{day}"
-    if os.path.exists(os.path.join(OUT, name, f"shade_{HOURS[-1]:02d}.npy")):
+    if os.path.exists(os.path.join(OUT, name, f"shade_{PROBE_HOUR:02d}.npy")):
         return name
     print(f"[shade] {day}: closest set {d} ({dday}) is {gap:.1f} deg off at noon "
           f"-> generating {name}")
@@ -144,11 +159,54 @@ def _dirs_for(mode):
 
 
 def _shade_path(hour, mode="summer"):
+    """The raster for this hour, or None when there is none -- meaning FULL SHADE.
+
+    None is a real answer, not a failure: the sun is below SUN_MIN_DEG for the dark half
+    of the clock and pipeline.shade deliberately writes no file for those hours. Callers
+    substitute 1.0.
+
+    A missing file with the sun UP is a different thing entirely -- a half-built set --
+    and is reported rather than silently priced as a shaded street.
+    """
+    # THE SUN DECIDES FIRST, THE DISK SECOND, and that order is not cosmetic. The
+    # directory chain ends in the January set as a last resort, so asking the disk first
+    # answered "is 07:00 dark on 24 August?" with out/v2/shade_07.npy -- a SUMMER DAWN
+    # raster stood in for a winter night, which is the one substitution the shade-set
+    # machinery above exists to prevent. Below SUN_MIN_DEG there is no file to look for.
+    if not _sun_up(_shade_day(mode), hour):
+        return None
     for d in _dirs_for(mode):
         p = os.path.join(OUT, d, f"shade_{hour:02d}.npy") if d else f"{OUT}/shade_{hour:02d}.npy"
         if os.path.exists(p):
             return p
-    return f"{OUT}/shade_{hour:02d}.npy"
+    print(f"[shade] MISSING shade_{hour:02d}.npy for {mode} with the sun up "
+          f"-- that hour will be priced as fully shaded")
+    return None
+
+
+def _shade_day(mode):
+    """The day whose sunrise and sunset decide which hours have rasters.
+
+    The day BEING PRICED when one was given, not the day the closest set on disk was
+    generated for: whether the sun is up is a fact about today, and the set is only ever
+    within SHADE_TOL_DEG of today anyway.
+    """
+    if isinstance(mode, str) and _DATE_RE.match(mode):
+        return mode
+    return _raster_day(mode)
+
+
+def _sun_up(day, hour):
+    """Is the sun high enough at `day hour:00` for the shadow sweep to resolve anything?
+
+    The SAME test the sweep makes (shadow.SUN_MIN_DEG), so "there is no raster" and
+    "there is no beam" are one statement rather than two that can drift apart.
+    """
+    from ..physics.shadow import SUN_MIN_DEG
+    try:
+        return sun_position(pd.Timestamp(f"{day} {int(hour):02d}:00", tz=TZ))[1] >= SUN_MIN_DEG
+    except Exception:
+        return True                              # cannot tell -> treat a gap as a fault
 
 
 # Which SVF raster the engine reads. svf_veg is svf_bldg with the canopy's TRUE
@@ -256,7 +314,11 @@ def edge_index(G, mode="summer"):
         "shade": np.zeros((len(HOURS), n), dtype=np.float32),
     }
     for i, h in enumerate(HOURS):
-        E["shade"][i] = take(np.load(_shade_path(h, mode), mmap_mode="r"))
+        p = _shade_path(h, mode)
+        # No raster = the sun is down = every edge fully shaded. Not loaded, not stored
+        # as a raster, and not a special case anywhere downstream: 1.0 is the same
+        # number the sweep would have written into every cell of a night file.
+        E["shade"][i] = 1.0 if p is None else take(np.load(p, mmap_mode="r"))
     _apply_decks(G, edges, E, g, mode)
     svf_p = _svf_path()
     if svf_p:
@@ -274,7 +336,13 @@ def edge_index(G, mode="summer"):
 
 
 def _file_sig(path):
-    """(size, mtime) signature, cheap and enough to spot a regenerated raster."""
+    """(size, mtime) signature, cheap and enough to spot a regenerated raster.
+
+    None for a path that is None -- a dark hour has no raster, and "no file" is a
+    perfectly good cache key for it.
+    """
+    if path is None:
+        return None
     try:
         st = os.stat(path); return [st.st_size, int(st.st_mtime)]
     except OSError:
@@ -310,24 +378,44 @@ def _key(wx_hours, date, mode="summer"):
 RASTER_CACHE = os.environ.get("SHADEME_TSURF_RASTER", "0") == "1"
 
 
-def surface_temps(wx, g, cache=None, mode="summer"):
-    """{hour: Ts raster (K)} for the whole grid. The march is ~33 s."""
+def surface_temps(wx, g, cache=None, mode="summer", on_hour=None):
+    """{hour: Ts raster (K)} for the whole grid. The march is ~33 s.
+
+    `on_hour(hour, ts)` streams instead: each hour is handed over as it is reached and
+    NOT accumulated, and the return is empty. That is the mode attach_tsurf uses, and
+    going to the full 24 h clock is why it has to. A Ts raster is 24 MB on the real grid
+    and the router never reads one -- it reads 8 samples along each edge -- so holding 24
+    of them is 582 MB spent to be immediately thrown away. Measured peak RSS over the
+    same 24 h march on this grid: 865 MB streaming against 1153 MB accumulating, and the
+    same 865 MB as the OLD 15-hour window streamed. The extra nine hours are free.
+    See surface_temp.march's own note on peak RAM.
+    """
     cache = RASTER_CACHE if cache is None else cache
     key = _key(wx["hours"], wx.get("date", "?"), mode)
     path = f"{OUT}/tsurf_cache_{key}.npz"
     if cache and os.path.exists(path):
         z = np.load(path)
+        if on_hour is not None:
+            for k in z.files:
+                on_hour(int(k), z[k])
+            return {}
         return {int(k): z[k] for k in z.files}
     _sp = _svf_path()
     svf = (np.load(_sp) if _sp else np.ones((g["h"], g["w"]), dtype=np.float32))
     mat = (np.load(f"{OUT}/material_id.npy") if os.path.exists(f"{OUT}/material_id.npy")
            else np.zeros((g["h"], g["w"]), dtype=np.uint8))
     props = json.load(open(f"{OUT}/material_props.json"))
-    shade = {h: np.load(_shade_path(h, mode), mmap_mode="r") for h in HOURS}
-    ts = ST.march(shade, svf, mat, props, wx["hours"], hours=HOURS, keep=True)
+    # Only the hours with a raster. march() fills the rest with DEFAULT_SHADE = 1.0,
+    # which is exactly right for them and is why the dark half of the clock needs no
+    # files: see _shade_path.
+    shade = {h: np.load(p, mmap_mode="r") for h, p in
+             ((h, _shade_path(h, mode)) for h in HOURS) if p is not None}
+    keep = cache or on_hour is None
+    ts = ST.march(shade, svf, mat, props, wx["hours"], hours=HOURS,
+                  keep=keep, on_hour=on_hour)
     if cache:
         np.savez_compressed(path, **{str(k): v for k, v in ts.items()})
-    return ts
+    return ts if on_hour is None else {}
 
 
 def _props_vec(props, key, default):
@@ -463,16 +551,21 @@ def attach_tsurf(E, G, wx, g=None, mode="summer", cache=True):
         E["tsurf_k"] = {int(k): z[k].astype(np.float64) for k in z.files}
         _attach_walls(E, wx, mode)
         return E["tsurf_k"]
-    ts = surface_temps(wx, g, mode=mode)
     take = _sampler(G, E["edges"], g)
     E["tsurf_k"] = {}
-    for h in HOURS:
-        v = take(ts[h]).astype(np.float64)
+
+    def sample(h, ts_h):
+        """8 samples per edge, then the raster is dropped. See surface_temps(on_hour)."""
+        v = take(ts_h).astype(np.float64)
         row = wx["hours"].get(h) or wx["hours"].get(str(h)) or {}
         ta = float(row.get("temperature_2m") or 20.0)
-        v = np.where(E["indoor"], INDOOR_TA + 273.15,
-                     np.where(E["covered"], ta + 273.15, v))
-        E["tsurf_k"][h] = v
+        E["tsurf_k"][h] = np.where(E["indoor"], INDOOR_TA + 273.15,
+                                   np.where(E["covered"], ta + 273.15, v))
+
+    surface_temps(wx, g, mode=mode, on_hour=sample)
+    missing = [h for h in HOURS if h not in E["tsurf_k"]]
+    if missing:
+        raise RuntimeError(f"surface march emitted no Ts for hours {missing}")
     if cache:
         np.savez_compressed(path, **{str(k): v.astype(np.float32)
                                      for k, v in E["tsurf_k"].items()})
