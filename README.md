@@ -86,7 +86,7 @@ start until the data is built, and it will refuse with a message telling you so.
 git clone https://github.com/Tchanwangsa/shademe.git && cd shademe
 uv sync
 uv run python -m shademe.pipeline.build_all
-uv run uvicorn shademe.api.main:app --host 0.0.0.0 --port 8011
+uv run shademe-api --port 8011
 ```
 
 Then check it in another terminal:
@@ -139,11 +139,69 @@ Assuming [Quickstart](#quickstart) has been done once — `uv sync` **and**
 `uv run python -m shademe.pipeline.build_all` — the server is:
 
 ```bash
-uv run uvicorn shademe.api.main:app --host 0.0.0.0 --port 8011
+uv run shademe-api --port 8011
 ```
 
 `GET /health` `/conditions` `/routes?from_lat=&from_lon=&to_lat=&to_lon=&unacclimatised=&vulnerable=`
 `/search?q=` `/reverse?lat=&lon=`, plus OpenAPI at `/docs`.
+
+`uv run uvicorn shademe.api.main:app --host 0.0.0.0 --port 8011` still works and is what
+the container runs; `shademe-api` is the same app plus the clock flags below.
+
+### Pinning the clock
+
+The API prices the wall clock and takes no `hour` parameter — a demo that can be dialled
+to its best hour is not evidence. The one exception is a **whole-server pin**, which is
+what you launch with for a demo in August:
+
+```bash
+uv run shademe-api --date 2026-01-27 --time 16:00 --port 8011
+```
+
+**27 January 2026 reached 43.4 °C at 16:00** under a near-clear sky — the hottest archived
+day in this dataset. Melbourne in late August tops out near 16 °C with UTCI inside the
+no-stress band, where every rung of the thermal ladder collapses to the same walk and the
+product has nothing to show. At 16:00 on 27 January it returns four distinct options
+spanning a 24% detour.
+
+The pin moves the **whole world** to one instant, not one number:
+
+| what | follows the pin |
+| --- | --- |
+| weather | Open-Meteo **archive** for that day, disk-cached (`data/weather_cache_2026-01-27.json`) |
+| shade rasters | the set within 2° of that day's noon sun — 27 Jan is served by `out/day_2026-01-26` |
+| sun position | that day's real azimuth and elevation, at that half-hour slot |
+| UV | modelled clear-sky × cloud. The **live ARPANSA measurement is refused** under a pin: it publishes the current index and no other, so on 27 January it would be this afternoon's real number for the wrong day |
+| opening hours | that day's weekday — 27 Jan 2026 is a **Tuesday**, so the arcade gate is Tuesday's |
+| arrival times | counted off the pinned `as_of`, so the cards do not drift |
+
+Both flags are independent. `--date` alone prices that day at the real time of day (what
+the bench scripts have always done); `--time` alone freezes today at that hour. The pinned
+instant is **frozen** for the life of the process, so a ten-minute demo does not slide into
+the next slot and re-march the surface temperatures halfway through.
+
+Nothing is hidden. Every response carries `conditions.clock`:
+
+```json
+{ "pinned": true, "date": "2026-01-27", "time": "16:00",
+  "real_today": "2026-08-24", "source": "SHADEME_DATE=2026-01-27 + SHADEME_TIME=16:00" }
+```
+
+the provenance one-liner reads `demo day 2026-01-27 16:00 PINNED`, and the mobile app
+shows a third chip over the map reading **Pinned · 2026-01-27 · 16:00**.
+
+`SHADEME_DATE` and `SHADEME_TIME` are the same two knobs as environment variables, for the
+container and for the bench scripts, which have no argv to pass.
+
+Two things to know before you stand up:
+
+* **Start it a minute early.** The first engine state — shade set, edge index, surface
+  energy-balance march — takes ~40 s, and the prewarm thread pays for it at start-up
+  rather than making the first `/routes` wait. `GET /health` says when it is warm.
+* **The archive fetch is cached to disk on first run**, so the demo survives dead wifi
+  after that; a stale cache is preferred to a lie and says so in `source`. On a machine
+  that has never fetched 27 January, warm it once with network up:
+  `uv run python -c "from shademe.api import weather; weather.get('2026-01-27')"`
 
 ### Place search
 

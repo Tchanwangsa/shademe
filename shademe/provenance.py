@@ -196,8 +196,16 @@ def stamp(mode="summer", hours=None):
         from .api.weather import resolve_day as _rd
         s["demo_day"] = _rd()
     except Exception:
-        s["demo_day"] = os.environ.get("SHADEME_DATE") or \
-            os.environ.get("SHADEME_DATE", "2026-01-26")
+        from .clock import date as _cd
+        s["demo_day"] = _cd()
+    # AND WHICH CLOCK CHOSE IT. `demo_day` alone cannot tell a server running on 27
+    # January from one pinned to it, and the whole point of this stamp is that a figure
+    # travels with the config that produced it.
+    try:
+        from .clock import describe as _cdesc
+        s["clock"] = _cdesc()
+    except Exception as e:
+        s["clock"] = {"error": repr(e)}
 
     # Every temperature the engine reports passes through the bias correction, so stamp
     # the mode plus the sha of the fitted table -- a re-fit then shows as a different
@@ -248,7 +256,12 @@ def line(s=None, **kw):
         f"door={c.get('door_m')}m rise={c.get('rise_m_per_m')}x" if "door_m" in c else None,
         f"INDOOR_TA={c.get('INDOOR_TA')}" if "INDOOR_TA" in c else None,
         f"TAU_LEAF={p.get('TAU_LEAF')} RAY_STEP={p.get('RAY_STEP')} beam={p.get('BEAM')}",
-        f"demo day {s.get('demo_day')}",
+        # THE PIN, NOT JUST THE DAY. A pinned clock is a config that moves every number
+        # on the response, so it travels with them: "demo day 2026-01-27 16:00 PINNED"
+        # cannot be mistaken for a server that happens to be running on 27 January.
+        f"demo day {s.get('demo_day')}"
+        + (f" {s['clock']['time']}" if (s.get("clock") or {}).get("time") else "")
+        + (" PINNED" if (s.get("clock") or {}).get("pinned") else ""),
         f"bias {s['bias'].get('mode')}/{s['bias'].get('table')}" if "bias" in s else None,
         f"@{s['git'].get('commit')}" + ("+dirty" if s["git"].get("dirty") else ""),
     ]
@@ -270,7 +283,8 @@ def block(s=None, **kw):
         "  dsm        " + "  ".join(f"{k.replace('dsm_','')} {v}" for k, v in s["dsm"].items()),
         "  physics    " + "  ".join(f"{k}={v}" for k, v in s["physics"].items()),
         "  cost       " + "  ".join(f"{k}={v}" for k, v in s["cost"].items()),
-        f"  weather    {w}   demo day {s.get('demo_day')}",
+        f"  weather    {w}   demo day {s.get('demo_day')}"
+        f"   clock {(s.get('clock') or {}).get('source', '?')}",
         f"  bias       {s.get('bias',{}).get('mode')}  table {s.get('bias',{}).get('table')}",
         "  src        " + "  ".join(f"{k} {v}" for k, v in s["src"].items()),
     ])

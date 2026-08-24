@@ -106,6 +106,7 @@ Everything is optional; the defaults are what the demo runs.
 | --- | --- | --- |
 | `PORT` | `8011` | Port the server binds. Most hosts set this for you. |
 | `SHADEME_DATE` | today | Pin the day being priced. Useful for a repeatable demo. |
+| `SHADEME_TIME` | wall clock | Pin the time of day, frozen for the life of the process. Pairs with `SHADEME_DATE`; either works alone. Locally these two are the `shademe-api --date / --time` flags. |
 | `SHADEME_CORS_ORIGINS` | `*` | Comma-separated origins. Narrow this for anything public. |
 | `SHADEME_PREWARM_S` | `120` | How often the warm thread re-checks the weather payload. |
 | `SHADEME_OUT_DIR` | `/app/out` | Where the derived rasters live. |

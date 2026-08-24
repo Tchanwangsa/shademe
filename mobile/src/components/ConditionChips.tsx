@@ -13,10 +13,11 @@ import { Card } from './ui/Card';
  * read in a glance while walking, so anything it says twice it says at the cost of the
  * thing it says once.
  *
- * No clock either. The engine prices the wall clock and nothing else, so a time readout
- * would only invite the question of whether it can be changed -- it cannot. That is now
- * true of every hour: the 06..20 clamp is gone, so the glyph is the sky at THIS hour and
- * `night` is one of the states it can be.
+ * No clock either, while the server is on the wall clock: a time readout would only
+ * invite the question of whether it can be changed. That is true of every hour -- the
+ * 06..20 clamp is gone, so the glyph is the sky at THIS hour and `night` is one of the
+ * states it can be. A server launched with a PINNED clock is the one case where the time
+ * is shown, because there it genuinely is not the phone's, and the third chip says so.
  */
 export function ConditionChips({ conditions }: { conditions: Conditions | null }) {
   const theme = useTheme();
@@ -51,13 +52,21 @@ export function ConditionChips({ conditions }: { conditions: Conditions | null }
         </Card>
       ) : null}
 
-      {/* Only ever shown when the engine is NOT pricing today. The reading would
-          otherwise read as live while being a pinned archive day. */}
-      {!conditions.is_today ? (
+      {/* Only ever shown when the engine is NOT pricing right now. The reading would
+          otherwise read as live while being a pinned archive day.
+
+          The TIME rides on it too, and it has to: a pinned clock is frozen for the life
+          of the server, so 43 degrees stays on screen while the phone's own clock walks
+          past it. Without the time the only visible contradiction is one the user
+          resolves by assuming the app is stale. */}
+      {!conditions.is_today || conditions.clock?.pinned ? (
         <Card className="justify-center px-3 py-2">
-          <Text className="text-[11px] leading-tight text-ink-soft">Not today</Text>
+          <Text className="text-[11px] leading-tight text-ink-soft">
+            {conditions.clock?.pinned ? 'Pinned' : 'Not today'}
+          </Text>
           <Text className="text-[13px] font-medium leading-4 text-ink dark:text-paper">
             {conditions.date}
+            {conditions.clock?.time ? ` · ${conditions.clock.time}` : ''}
           </Text>
         </Card>
       ) : null}

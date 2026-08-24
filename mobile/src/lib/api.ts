@@ -26,9 +26,21 @@ export interface Conditions {
   hour: number;
   /** Where the radiation came from: the 15-minute series, or interpolated hourly. */
   rad_source: string;
-  /** The day actually priced. Today unless SHADEME_DATE pins it. */
+  /** The day actually priced. Today unless the server's clock is pinned. */
   date: string;
+  /** Against the REAL today, not against `clock.date` -- so a pinned day reads false. */
   is_today: boolean;
+  /** Which clock priced this response. `pinned` is true when the server was launched
+   *  with --date / --time, in which case `time` is the frozen wall clock (or null when
+   *  only the day was pinned) and nothing on screen is live. */
+  clock: {
+    pinned: boolean;
+    date: string;
+    date_pinned: boolean;
+    time: string | null;
+    real_today: string;
+    source: string;
+  };
   temperature: number;
   apparent_temperature: number;
   /** Null when neither the live network nor the feed could answer. Show nothing then. */

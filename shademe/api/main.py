@@ -5,7 +5,10 @@ the mobile client talks to. It makes these commitments:
 
   * REAL TIME, NOT A SCRUBBER. There is no `hour` parameter and no clamp. Every request
     is priced at the wall clock in Australia/Melbourne, all 24 hours of it. A demo that
-    can be dialled to its best hour is not evidence.
+    can be dialled to its best hour is not evidence. The ONE exception is a whole-server
+    pin -- `shademe-api --date 2026-01-27 --time 16:00` -- which moves the entire world
+    to one real archived instant rather than letting a client pick a flattering hour per
+    request, and which every response declares in `conditions.clock`. See shademe.clock.
   * OPTIONS, NOT A PAIR. `/routes` walks a ladder of K -- the thermal knob -- and a
     second ladder under the UV objective, and returns the distinct paths that fall out of
     both. Two searches producing the same walk collapse to one option, which is the
@@ -40,6 +43,7 @@ from .cost import (summarise, segments, thermal_summary, compare_thermal,
                    weighted_minutes, K_DEFAULT)
 from ..paths import OUT
 from .. import timegrid as TG
+from .. import clock as CLOCK
 
 # THE WHOLE CLOCK, IN HALF-HOUR SLOTS. timegrid owns the grid; this module only prices
 # on it. There used to be two restrictions here and both are gone:
@@ -58,8 +62,9 @@ from .. import timegrid as TG
 #     sun has set. The `beam` flag it reported is gone; `condition` says `night` instead,
 #     from the same SUN_MIN_DEG the router gates on (see api/sky.py).
 #
-# The day priced is today unless SHADEME_DATE pins it; the shade set follows that date,
-# and the prewarm thread -- not the first request -- pays for generating it.
+# The day priced is today unless the clock is pinned (SHADEME_DATE / SHADEME_TIME, or
+# the --date / --time flags that set them); the shade set follows that date, and the
+# prewarm thread -- not the first request -- pays for generating it.
 FALLBACK_HOUR = 16          # only for the graph-rebuild path, never for pricing
 
 # The thermal ladder for a walker who declared nothing. 0 is "shortest, no preference"
@@ -278,7 +283,7 @@ def warm_once():
     WARM.update(state="building", error=None)
     from . import engine as _e
     h = now_slot()
-    w = weather.block(h, now_min=TG.of(now_local()))
+    w = weather.block(h, now_min=TG.of(now_local()) if CLOCK.is_live() else None)
     st = engine_state()
     with APPLY_LOCK:
         if h not in st["solved"]:
@@ -339,8 +344,10 @@ app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_methods=["*
 # --- time and conditions --------------------------------------------------------
 
 def now_local():
-    import pandas as pd
-    return pd.Timestamp.now(tz=weather.TZ)
+    """The instant being priced. The wall clock in Australia/Melbourne unless the server
+    was launched with a pinned demo clock -- see shademe.clock, and `conditions.clock` on
+    every response, which says which of the two answered."""
+    return CLOCK.now()
 
 
 def now_hour():
@@ -375,7 +382,7 @@ def conditions_block():
     # publishes the current value and no other (see uv.index_for). Passing it explicitly
     # keeps that a property of this call site rather than an assumption inside
     # weather.block, which tools/ calls for other slots.
-    w = weather.block(h, now_min=TG.of(t))
+    w = weather.block(h, now_min=TG.of(t) if CLOCK.is_live() else None)
     return {
         "as_of": t.isoformat(),
         "slot": h,
@@ -383,7 +390,13 @@ def conditions_block():
         "hour": TG.hour_of(h),                  # legacy field, kept for older clients
         "rad_source": w.get("rad_source"),
         "date": w["date"],
-        "is_today": w["date"] == str(t.date()),
+        # AGAINST THE REAL TODAY, never against the clock's own date -- which is the
+        # pinned day when there is one, and would therefore call a pinned January
+        # afternoon "today" and hide the chip that exists to say it is not.
+        "is_today": w["date"] == CLOCK.real_today(),
+        # WHICH CLOCK PRICED THIS. Null-free and always present: a temperature of 43 C is
+        # not a claim about now unless something on the response says it is.
+        "clock": CLOCK.describe(),
         "temperature": w["temperature"],
         "apparent_temperature": w["apparent_temperature"],
         "uv_index": w["uv_index"],
@@ -990,9 +1003,43 @@ def get_routes(from_lat: float, from_lon: float, to_lat: float, to_lon: float,
     }
 
 
-def run():
-    """Console-script entry point: `shademe-api`. Honours HOST/PORT."""
-    import uvicorn
-    uvicorn.run("shademe.api.main:app",
-                host=os.environ.get("HOST", "0.0.0.0"),
-                port=int(os.environ.get("PORT", "8011")))
+def run(argv=None):
+    """Console-script entry point: `shademe-api`. Also `python -m shademe.api.main`.
+
+    The flags set the process-wide clock BEFORE uvicorn imports anything that reads it,
+    which is the whole reason shademe.clock looks the environment up lazily instead of
+    snapshotting it at import. HOST/PORT/SHADEME_DATE/SHADEME_TIME still work on their
+    own for the container, which has no argv to pass -- see the Dockerfile.
+    """
+    import argparse, uvicorn
+    ap = argparse.ArgumentParser(
+        prog="shademe-api",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="ShadeMe API. Prices the wall clock unless you pin it.",
+        epilog="demo the January heat:\n"
+               "  shademe-api --date 2026-01-27 --time 16:00\n\n"
+               "27 January 2026 reached 43.4 C at 16:00 under a clear sky. The weather\n"
+               "is that day's real archive, the shadows are that day's real sun, and the\n"
+               "opening-hours gate keeps that day's Tuesday timetable.")
+    ap.add_argument("--date", metavar="YYYY-MM-DD",
+                    help="pin the day priced. Default: today.")
+    ap.add_argument("--time", metavar="HH:MM",
+                    help="pin the time of day, frozen for the life of the process. "
+                         "Default: the real time of day.")
+    ap.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8011")))
+    a = ap.parse_args(argv)
+    if a.date or a.time:
+        try:
+            CLOCK.pin(a.date, a.time)
+        except ValueError as e:
+            ap.error(str(e))
+    t = CLOCK.now()
+    print(f"[shademe] clock: {t.isoformat()} ({CLOCK.describe()['source']})"
+          + ("" if CLOCK.is_live() else
+             f" -- PINNED, frozen at {TG.label(TG.snap(TG.of(t)))} on {CLOCK.date()}"))
+    uvicorn.run("shademe.api.main:app", host=a.host, port=a.port)
+
+
+if __name__ == "__main__":
+    run()

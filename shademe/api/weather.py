@@ -27,12 +27,15 @@ from . import uv as UV
 from ..paths import DATA
 from .. import timegrid as TG
 from ..timegrid import RAD_STEP_MIN
+from .. import clock as CLOCK
 
 LAT, LON = -37.8136, 144.9631
-TZ = "Australia/Melbourne"
+TZ = CLOCK.TZ
 
-# Hotter archive days worth naming: 2026-01-26 (32 C), 2026-01-24 (35.9), 2026-01-27 (42.8).
-PINNED_DATE = os.environ.get("SHADEME_DATE")
+# Hotter archive days worth naming: 2026-01-26 (32 C), 2026-01-24 (35.9), 2026-01-27 (43.4).
+# Which day is served when a caller passes none is `clock`'s question, not this module's,
+# and it is asked on every call rather than snapshotted at import -- `shademe-api --date`
+# sets the pin AFTER this module has been imported, so a module-level read cannot see it.
 
 # Legacy season names, for the bench scripts that still pass one. They resolve to a date
 # like everything else; they are not a second code path.
@@ -40,14 +43,15 @@ LEGACY_DAYS = {"summer": "2026-01-26", "winter": None, "cold": None}
 
 
 def today():
-    return time.strftime("%Y-%m-%d", time.localtime())
+    return CLOCK.real_today()
 
 
 def resolve_day(day=None):
-    """Whatever a caller passed -> a YYYY-MM-DD string. None/'' means today."""
+    """Whatever a caller passed -> a YYYY-MM-DD string. None/'' means the day the clock
+    is standing on: today, or the pinned demo day. See shademe.clock."""
     if day in LEGACY_DAYS:
         day = LEGACY_DAYS[day]
-    return str(day) if day else (PINNED_DATE or today())
+    return str(day) if day else CLOCK.date()
 
 
 # uv_index_clear_sky rides along because Open-Meteo returns it EQUAL to `uv_index` for

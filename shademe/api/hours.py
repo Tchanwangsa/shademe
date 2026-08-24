@@ -13,10 +13,11 @@ class. The gate is correct; the coverage is a data problem.
 import json, os
 
 from ..paths import DATA
+from .. import clock as CLOCK
 
 PATH = os.path.join(DATA, "indoor_hours.json")
 DOW = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-TZ = "Australia/Melbourne"
+TZ = CLOCK.TZ
 
 _T = None
 
@@ -82,8 +83,10 @@ def closed_keys(hour, dow):
 
 
 def now_dow():
-    import pandas as pd
-    return pd.Timestamp.now(tz=TZ).dayofweek
+    """The weekday of the instant being priced -- which is the PINNED one when the clock
+    is pinned. It has to be: pricing 27 January (a Tuesday) against today's Monday hours
+    would open the arcades a demo walks through on the wrong day's timetable."""
+    return CLOCK.now().dayofweek
 
 
 def describe(hour, dow):
